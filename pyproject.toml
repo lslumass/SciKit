@@ -43,16 +43,16 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/shanlongli/scikit"
-Repository = "https://github.com/shanlongli/scikit"
-Issues = "https://github.com/shanlongli/scikit/issues"
+Homepage = "https://github.com/shanlongli/SciKit"
+Repository = "https://github.com/shanlongli/SciKit"
+Issues = "https://github.com/shanlongli/SciKit/issues"
 
 [project.scripts]
-scikit = "scikit.cal:app"
+scikit = "SciKit.cals:app"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["scikit*"]
+include = ["SciKit*"]
 
 [tool.black]
 line-length = 88
