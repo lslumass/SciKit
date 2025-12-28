@@ -1,0 +1,3 @@
+[console_scripts]
+scical = SciKit.cals:app
+scikit = SciKit.tools:app

@@ -14,25 +14,24 @@ app = typer.Typer(help="Hyres/iConRNA tools")
 def psf2top(
     pdb: str = typer.Option("conf.pdb", help="Input pdb file"),
     psf: str = typer.Option("conf.psf", help="Input psf file"),
-    outtop: str = typer.Option("conf.top", help="Output top file"),  # Renamed
-    outgro: str = typer.Option("conf.gro", help="Output gro file"),  # Renamed
-    box: float = typer.Option(100.0, help='Box size in nm'),
+    top: str = typer.Option("conf.top", help="Output top file"),
+    gro: str = typer.Option("conf.gro", help="Output gro file"),
+    box: float = typer.Option(100.0, help='Box size'),
 ) -> None:
     top_RNA, param_RNA = utils.load_ff('RNA')
     top_pro, param_pro = utils.load_ff('Protein')
-    pdb_obj = PDBFile(pdb)
-    psf_obj = CharmmPsfFile(psf)
-    topology = psf_obj.topology
+    pdb = PDBFile(pdb)
+    psf = CharmmPsfFile(psf)
+    top = psf.topology
     params = CharmmParameterSet(top_RNA, param_RNA, top_pro, param_pro)
-    psf_obj.setBox(box, box, box)
-    
-    system = psf_obj.createSystem(params, nonbondedMethod=CutoffPeriodic, constraints=HBonds)
+    psf.setBox(box, box, box)
+    system = psf.createSystem(params, nonbondedMethod=CutoffPeriodic, constraints=HBonds)
 
-    structure = chem.openmm.load_topology(topology, system)
-    structure.save(outtop, overwrite=True)
-    structure.coordinates = pdb_obj.positions
-    structure.save(outgro, overwrite=True)
-    typer.echo(f'Converted to {outtop} and {outgro} files.')
+    structure = chem.openmm.load_topology(top, system)
+    structure.save(f'./{top}', overwrite=True)
+    structure.coordinates = pdb.positions
+    structure.save(f'./{gro}', overwrite=True)
+    typer.echo(f'Convert to {top} and {gro} files.')
 
 
 @app.command()

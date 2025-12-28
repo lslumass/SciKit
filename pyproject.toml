@@ -48,7 +48,8 @@ Repository = "https://github.com/shanlongli/SciKit"
 Issues = "https://github.com/shanlongli/SciKit/issues"
 
 [project.scripts]
-scikit = "SciKit.cals:app"
+scical = "SciKit.cals:app"
+scikit = "SciKit.tools:app"
 
 [tool.setuptools.packages.find]
 where = ["."]
