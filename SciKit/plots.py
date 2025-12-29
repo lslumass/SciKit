@@ -18,7 +18,7 @@ def general_temp(num_row, num_col, size_x, size_y, *args, **kwargs):
             plt.setp(ax.spines.values(), linewidth=2)
     else:
         axs.tick_params(axis="both", which='major', direction='in', width=2, length=8.0)
-        ax.tick_params(axis="both", which='minor', direction='in', width=2, length=5.0)
+        axs.tick_params(axis="both", which='minor', direction='in', width=2, length=5.0)
         plt.setp(axs.spines.values(), linewidth=2)
 
     plt.rcParams['font.family'] = "Arial"
