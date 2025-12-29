@@ -136,6 +136,46 @@ def block_mean(data, division):
     error = np.std([part1, part2])
     return average, error
 
+def rms(data):
+    data = np.asarray(data)
+    return np.sqrt(np.mean(data**2))
+
+def block_bootstrap(data, blocksize=100, nsamples=2000, statistic=rms):
+    '''
+    calculate the block bootstrap standard deviation
+    Pramater:
+        data: 1D array of data points
+        blocksize: int, size of each block, default=100
+        nsamples: number of bootstrap samples, default=1000
+        statistic: function to calculate the statistic of interest, like np.mean, default is rms
+    Return:
+        Block bootstrap standard deviation
+    '''
+    data = np.asarray(data)
+    n = len(data)
+    bootstrap_stats = []
+    for _ in range(nsamples):
+        # Generate bootstrap sample using circular block bootstrap
+        bootstrap_sample = []
+        while len(bootstrap_sample) < n:
+            # Randomly select a starting index
+            start_idx = np.random.randint(0, n)
+            # Extract a block (with circular wrapping)
+            block = []
+            for i in range(blocksize):
+                block.append(data[(start_idx + i) % n])
+            bootstrap_sample.extend(block)
+        
+        # trim to exact length
+        bootstrap_sample = bootstrap_sample[:n]
+        # calculate statistic
+        bootstrap_stats.append(statistic(bootstrap_sample))
+
+    # calculate standard deviation
+    sd = np.std(bootstrap_stats, ddof=1)
+
+    return sd
+
 
 def remove_zero(xs, ys):
     '''
