@@ -140,7 +140,7 @@ def rms(data):
     data = np.asarray(data)
     return np.sqrt(np.mean(data**2))
 
-def block_bootstrap(data, blocksize=100, nsamples=2000, statistic=rms):
+def block_bootstrap(data, blocksize=1000, nsamples=1000, statistic=rms):
     '''
     calculate the block bootstrap standard deviation
     Pramater:

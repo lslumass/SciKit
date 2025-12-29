@@ -65,6 +65,7 @@ def rg(
     avg1, sd1 = np.mean(rgs), bb(rgs, statistic=np.mean)
     avg2, sd2 = np.sqrt(np.mean(rgs**2)), bb(rgs)
     typer.echo(f"Finished!\n  <Rg> = {avg1:.2f} ± {sd1:.2f} A\n  RMS Rg = {avg2:.2f} ± {sd2:.2f} A")
+    typer.echo(f"  SD(Rg) = {np.std(rgs, ddof=1)}")
     typer.echo(f"Results written to {out}")
 
 
