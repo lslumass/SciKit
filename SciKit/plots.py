@@ -137,9 +137,9 @@ def add_break(ax, xranges=None, yranges=None):
         broken_and_clip_axes(ax, y=yranges[0], which='lower')
 
 
-def npy_contacts(ax, npy, cmap, x_shift, y_shift):
+def npy_contacts(ax, npy, cmap, x_shift, y_shift, **kwargs):
     contacts = np.load(npy)
     Nx = contacts.shape[0]
     Ny = contacts.shape[1]
-    im = ax.imshow(contacts, origin='lower', extent=[x_shift, Nx+x_shift, y_shift, Ny+y_shift], cmap=cmap)
+    im = ax.imshow(contacts, origin='lower', extent=[x_shift, Nx+x_shift, y_shift, Ny+y_shift], cmap=cmap, **kwargs)
     return im
