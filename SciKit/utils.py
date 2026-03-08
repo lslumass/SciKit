@@ -145,7 +145,7 @@ def block_bootstrap(data, blocksize=1000, nsamples=1000, statistic=rms):
     calculate the block bootstrap standard deviation
     Pramater:
         data: 1D array of data points
-        blocksize: int, size of each block, default=100
+        blocksize: int, size of each block, default=1000
         nsamples: number of bootstrap samples, default=1000
         statistic: function to calculate the statistic of interest, like np.mean, default is rms
     Return:

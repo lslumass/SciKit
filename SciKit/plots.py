@@ -1,5 +1,6 @@
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+import numpy as np
 
 
 def general_temp(num_row, num_col, size_x, size_y, *args, **kwargs):
@@ -134,3 +135,11 @@ def add_break(ax, xranges=None, yranges=None):
     if yranges is not None:
         scale_axes(ax, y_interval=[(yranges[0], yranges[1], 0.01)])
         broken_and_clip_axes(ax, y=yranges[0], which='lower')
+
+
+def npy_contacts(ax, npy, cmap, x_shift, y_shift):
+    contacts = np.load(npy)
+    Nx = contacts.shape[0]
+    Ny = contacts.shape[1]
+    im = ax.imshow(contacts, origin='lower', extent=[x_shift, Nx+x_shift, y_shift, Ny+y_shift], cmap=cmap)
+    return im
