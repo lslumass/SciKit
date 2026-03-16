@@ -29,6 +29,8 @@ extensions = [
     'myst_parser',
 ]
 
+autodoc_mock_imports = ["HyresBuilder"]
+
 templates_path = ['_templates']
 exclude_patterns = []
 
