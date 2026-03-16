@@ -4,11 +4,51 @@ import numpy as np
 
 
 def general_temp(num_row, num_col, size_x, size_y, *args, **kwargs):
-    '''
-    create a matplotlib figure;
-    plt.subplots(num_row, num_col, figsize=(size_x, size_y))
-    '''
+    """
+    Create a standardized matplotlib figure with a grid of subplots.
 
+    Initializes a figure using ``plt.subplots`` and applies consistent
+    tick formatting, spine linewidths, font settings, and default line/marker
+    styles across all axes. Intended as a base template for publication-ready figures.
+
+    Parameters
+    ----------
+    num_row : int
+        Number of subplot rows.
+    num_col : int
+        Number of subplot columns.
+    size_x : float
+        Figure width in inches.
+    size_y : float
+        Figure height in inches.
+    *args
+        Additional positional arguments forwarded to ``plt.subplots``.
+    **kwargs
+        Additional keyword arguments forwarded to ``plt.subplots``
+        (e.g., ``sharex``, ``sharey``, ``subplot_kw``).
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        The created figure object.
+    axs : matplotlib.axes.Axes or numpy.ndarray of Axes
+        A single ``Axes`` object if ``num_row * num_col == 1``,
+        otherwise a flattened 1-D array of ``Axes`` objects.
+
+    Notes
+    -----
+    - Major ticks: inward, width=2, length=8.
+    - Minor ticks: inward, width=1.5, length=4.
+    - Spine linewidth: 2.
+    - Font: Arial, size 18.
+    - Default line width: 2.0; marker: 'o', size 6.
+
+    Examples
+    --------
+    >>> fig, axs = general_temp(2, 3, 12, 8)
+    >>> axs[0].plot([1, 2, 3], [4, 5, 6])
+    >>> fig.savefig("output.png")
+    """
     fig, axs = plt.subplots(num_row, num_col, figsize=(size_x, size_y), *args, **kwargs)
     fig.tight_layout(pad=3)
     if num_row*num_col != 1:
@@ -32,56 +72,273 @@ def general_temp(num_row, num_col, size_x, size_y, *args, **kwargs):
 
     return fig, axs
 
+
 def set_grid(ax, *args, **kwargs):
+    """
+    Add a styled major grid to an axis.
+
+    Draws dashed major gridlines with reduced opacity, suitable for
+    background reference without overwhelming plotted data.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        The target axes on which the grid will be drawn.
+    *args
+        Additional positional arguments forwarded to ``ax.grid``.
+    **kwargs
+        Additional keyword arguments forwarded to ``ax.grid``
+        (e.g., ``color``, ``axis``).
+
+    Notes
+    -----
+    Grid style defaults: dashes=(5,5), linewidth=1, alpha=0.5.
+
+    Examples
+    --------
+    >>> fig, axs = general_temp(1, 1, 6, 4)
+    >>> set_grid(axs)
+    """
     ax.grid(which='major', ls='--', dashes=(5,5), lw=1, alpha=0.5, *args, **kwargs)
 
+
 def set_legend(ax, *args, **kwargs):
+    """
+    Add a styled legend to an axis.
+
+    Applies a white semi-transparent background with no visible edge,
+    keeping the legend readable without obstructing the plot.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        The target axes on which the legend will be placed.
+    *args
+        Additional positional arguments forwarded to ``ax.legend``.
+    **kwargs
+        Additional keyword arguments forwarded to ``ax.legend``
+        (e.g., ``loc``, ``ncol``, ``fontsize``).
+
+    Examples
+    --------
+    >>> ax.plot([1, 2], [3, 4], label='Data A')
+    >>> set_legend(ax, loc='upper left')
+    """
     ax.legend(facecolor='white', framealpha=0.7, edgecolor='white', *args, **kwargs)
 
-## merge the enties with same name and reorder
-#  order is the list of entries you expect, like ['line A', 'line B', 'line C'] 
+
 def merge_legend(ax, order=None, *args, **kwargs):
+    """
+    Deduplicate legend entries and optionally reorder them.
+
+    Useful when multiple plot calls share the same label (e.g., in a loop)
+    and only one representative legend entry is desired per label.
+    An explicit ``order`` list controls the final display sequence.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        The target axes whose legend will be rebuilt.
+    order : list of str, optional
+        Ordered list of label strings defining the desired legend sequence.
+        All labels in ``order`` must already exist among the plotted artists.
+        If ``None``, unique labels are displayed in their first-occurrence order.
+    *args
+        Additional positional arguments forwarded to ``ax.legend``.
+    **kwargs
+        Additional keyword arguments forwarded to ``ax.legend``
+        (e.g., ``loc``, ``ncol``).
+
+    Raises
+    ------
+    KeyError
+        If a label in ``order`` does not match any plotted artist label.
+
+    Examples
+    --------
+    >>> for val in data:
+    ...     ax.plot(x, val, color='blue', label='Series A')
+    >>> merge_legend(ax, order=['Series A', 'Series B'])
+    """
     handles, labels = ax.get_legend_handles_labels()
     unique = dict(zip(labels, handles))  # Remove duplicate labels
     if order is None:
-        ax.legend(unique.values(), unique.keys(), facecolor='white', framealpha=0.7, edgecolor='white', *args, **kwargs)  # Set unique legend
+        ax.legend(unique.values(), unique.keys(), facecolor='white', framealpha=0.7, edgecolor='white', *args, **kwargs)
     else:
         ordered_handels = [unique[label] for label in order]
         ordered_labels = [label for label in order]
         ax.legend(ordered_handels, ordered_labels, facecolor='white', framealpha=0.7, edgecolor='white', *args, **kwargs)
 
+
 def set_unique_legend(ax, *args, **kwargs):
+    """
+    Add a legend showing only the first occurrence of each unique label.
+
+    Operates on the current active axes (``plt.gca()``) to collect handles
+    and labels, deduplicates them by label string, then renders the legend
+    on the provided ``ax``.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        The target axes on which the deduplicated legend will be placed.
+    *args
+        Additional positional arguments (currently unused; reserved for
+        future forwarding to ``ax.legend``).
+    **kwargs
+        Additional keyword arguments (currently unused; reserved for
+        future forwarding to ``ax.legend``).
+
+    Notes
+    -----
+    This function reads handles from ``plt.gca()``, not from ``ax`` directly.
+    For multi-axes figures, prefer :func:`merge_legend` to avoid ambiguity.
+
+    Examples
+    --------
+    >>> ax.plot(x, y1, label='Experiment')
+    >>> ax.plot(x, y2, label='Experiment')   # duplicate label
+    >>> set_unique_legend(ax)
+    """
     handles, labels = plt.gca().get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
     ax.legend(by_label.values(), by_label.keys(), facecolor='white', framealpha=0.7, edgecolor='white')
 
+
 def number2letter(number, style=1):
-    if style ==1 :
-        if 1<= number <= 26:
+    """
+    Convert an integer (1–26) to its corresponding alphabetic character.
+
+    Parameters
+    ----------
+    number : int
+        Integer in the range [1, 26] to convert.
+    style : {1, 2}, optional
+        Output case style:
+
+        - ``1`` (default): uppercase letter (e.g., 1 → 'A').
+        - ``2``: lowercase letter (e.g., 1 → 'a').
+
+    Returns
+    -------
+    str
+        A single uppercase or lowercase letter.
+
+    Raises
+    ------
+    ValueError
+        If ``number`` is outside [1, 26] or ``style`` is not 1 or 2.
+
+    Examples
+    --------
+    >>> number2letter(3)
+    'C'
+    >>> number2letter(3, style=2)
+    'c'
+    """
+    if style == 1:
+        if 1 <= number <= 26:
             return chr(number + 64)
         else:
             raise ValueError("Number out of range. Please enter a number between 1 and 26.")
     elif style == 2:
-        if 1<= number <= 26:
+        if 1 <= number <= 26:
             return chr(number + 96)
         else:
             raise ValueError("Number out of range. Please enter a number between 1 and 26.")
     else:
         raise ValueError("Style out of range. Please enter a style of 1 or 2.")
 
+
 def set_label(axs, starting=1, style=1, x=-0.2, y=1.05, **kwargs):
+    """
+    Annotate a sequence of axes with alphabetic panel labels.
+
+    Places a bold letter label (e.g., 'A', 'B', … or '(a)', '(b)', …)
+    in the upper-left region of each axis using axis-relative coordinates.
+    Commonly used for multi-panel publication figures.
+
+    Parameters
+    ----------
+    axs : iterable of matplotlib.axes.Axes
+        Sequence of axes to label, processed in order.
+    starting : int, optional
+        Integer index of the first label (default ``1`` → 'A' or '(a)').
+    style : {1, 2}, optional
+        Label format:
+
+        - ``1`` (default): uppercase letter only (e.g., 'A', 'B', 'C').
+        - ``2``: lowercase letter in parentheses (e.g., '(a)', '(b)', '(c)').
+    x : float, optional
+        Horizontal position in axis-relative coordinates (default ``-0.2``).
+    y : float, optional
+        Vertical position in axis-relative coordinates (default ``1.05``).
+    **kwargs
+        Additional keyword arguments forwarded to ``ax.text``
+        (e.g., ``color``, ``fontsize``).
+
+    Raises
+    ------
+    ValueError
+        If ``style`` is not 1 or 2.
+
+    Examples
+    --------
+    >>> fig, axs = general_temp(1, 3, 12, 4)
+    >>> set_label(axs)               # labels: A, B, C
+    >>> set_label(axs, style=2)      # labels: (a), (b), (c)
+    >>> set_label(axs, starting=4)   # labels: D, E, F
+    """
     if style == 1:
         for i, ax in enumerate(axs):
-            label = number2letter(i+starting, style=1)
+            label = number2letter(i + starting, style=1)
             ax.text(x, y, label, transform=ax.transAxes, size=19, weight='bold', **kwargs)
     elif style == 2:
         for i, ax in enumerate(axs):
-            label = '(' + number2letter(i+starting, style=2) + ')'
+            label = '(' + number2letter(i + starting, style=2) + ')'
             ax.text(x, y, label, transform=ax.transAxes, size=19, weight='bold', **kwargs)
     else:
         raise ValueError("Style out of range. Please enter a style of 1 or 2.")
-    
+
+
 def color_cycle(id):
+    """
+    Return a hex color string from a fixed 10-color palette.
+
+    Mirrors matplotlib's default ``tab10`` color cycle, providing
+    convenient index-based access for consistent multi-series coloring.
+
+    Parameters
+    ----------
+    id : int
+        Color index in the range [1, 10]:
+
+        ====  =========  ===================
+        id    hex        approximate color
+        ====  =========  ===================
+        1     #1f77b4    muted blue
+        2     #ff7f0e    safety orange
+        3     #2ca02c    cooked asparagus green
+        4     #d62728    brick red
+        5     #9467bd    muted purple
+        6     #8c564b    chestnut brown
+        7     #e377c2    raspberry pink
+        8     #7f7f7f    middle gray
+        9     #bcbd22    curry yellow-green
+        10    #17becf    blue-teal
+        ====  =========  ===================
+
+    Returns
+    -------
+    str
+        Hex color string. Returns ``'#000000'`` (black) for any ``id``
+        not in [1, 10].
+
+    Examples
+    --------
+    >>> ax.plot(x, y, color=color_cycle(1))   # muted blue
+    >>> ax.plot(x, z, color=color_cycle(2))   # safety orange
+    """
     colors = {
         1 : '#1f77b4',
         2 : '#ff7f0e',
@@ -96,27 +353,75 @@ def color_cycle(id):
     }
     return colors.get(id, '#000000')
 
+
 def savefig(fig, filename):
+    """
+    Save a figure to disk at publication-quality resolution.
+
+    Wraps ``fig.savefig`` with ``dpi=600`` and ``bbox_inches='tight'``
+    to ensure all artists (titles, labels, legends) are included without
+    clipping and the output is suitable for journal submission.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+        The figure object to save.
+    filename : str or path-like
+        Output file path, including extension (e.g., ``'fig1.png'``,
+        ``'fig1.pdf'``, ``'fig1.svg'``). The format is inferred from
+        the extension.
+
+    Examples
+    --------
+    >>> fig, axs = general_temp(1, 2, 10, 4)
+    >>> savefig(fig, 'results/figure1.png')
+    """
     fig.savefig(filename, dpi=600, bbox_inches='tight')
 
 
 def insert_image(ax, image_path, x, y, zoom=1.0, rotation=0):
     """
-    Insert an image into a matplotlib axis.
-    
-    Parameters:
-    - ax: The axis to insert the image into.
-    - image_path: Path to the image file.
-    - x,y: Coordinates in the axis where the image will be placed.
-    - rotate: Angle to rotate the image (default is 0).
-    - zoom: Zoom factor for the image (default is 1.0).
+    Embed a raster image into a matplotlib axis at a specified data coordinate.
+
+    Reads an image file, optionally rotates it, and places it as an
+    ``AnnotationBbox`` artist anchored to the given data-space coordinates.
+    Useful for inset schematics, icons, or experimental photographs.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        The target axes into which the image will be inserted.
+    image_path : str or path-like
+        Path to the image file (any format supported by
+        ``matplotlib.image.imread``, e.g., PNG, JPEG).
+    x : float
+        Horizontal anchor position in data coordinates.
+    y : float
+        Vertical anchor position in data coordinates.
+    zoom : float, optional
+        Scaling factor applied to the image (default ``1.0``; values
+        below 1 shrink, above 1 enlarge).
+    rotation : float, optional
+        Counter-clockwise rotation angle in degrees (default ``0``).
+        Uses ``scipy.ndimage.rotate`` with nearest-neighbor interpolation.
+
+    Notes
+    -----
+    Rotation via ``scipy.ndimage.rotate`` may introduce black borders around
+    the image corners. For transparent PNGs, consider passing
+    ``reshape=False`` by patching the call if border artifacts occur.
+
+    Examples
+    --------
+    >>> fig, axs = general_temp(1, 1, 6, 6)
+    >>> insert_image(axs, 'schematic.png', x=0.5, y=0.5, zoom=0.3, rotation=45)
     """
     from matplotlib.offsetbox import OffsetImage, AnnotationBbox
     from scipy.ndimage import rotate
     import matplotlib.image as mimg
-    
+
     img = mimg.imread(image_path)
-    img = rotate(img, rotation)  # Rotate the image if needed
+    img = rotate(img, rotation)
     imagebox = OffsetImage(img, zoom=zoom)
     ab = AnnotationBbox(imagebox, (x, y), frameon=False)
     ax.add_artist(ab)
@@ -124,8 +429,35 @@ def insert_image(ax, image_path, x, y, zoom=1.0, rotation=0):
 
 def add_break(ax, xranges=None, yranges=None):
     """
-    xranges: tuple, (x_start, x_end) for x-axis break
-    yranges: tuple, (y_start, y_end) for y-axis break
+    Insert an axis break to omit a continuous range of x- or y-values.
+
+    Compresses the specified interval to near-zero width/height using
+    ``break_axes.scale_axes``, then adds a visual break indicator via
+    ``break_axes.broken_and_clip_axes``. Helpful when data has a large
+    gap that would otherwise compress the regions of interest.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        The target axes on which the break will be applied.
+    xranges : tuple of float, optional
+        ``(x_start, x_end)`` defining the x-axis interval to collapse.
+        If ``None``, no x-break is applied.
+    yranges : tuple of float, optional
+        ``(y_start, y_end)`` defining the y-axis interval to collapse.
+        If ``None``, no y-break is applied.
+
+    Notes
+    -----
+    Requires the third-party ``break_axes`` package. Both ``xranges`` and
+    ``yranges`` can be provided simultaneously to apply breaks on both axes.
+    The break marker is placed at the lower boundary of each specified range.
+
+    Examples
+    --------
+    >>> fig, axs = general_temp(1, 1, 6, 4)
+    >>> axs.plot([0, 1, 10, 11], [0, 1, 2, 3])
+    >>> add_break(axs, xranges=(2, 9))   # hide x ∈ [2, 9]
     """
     from break_axes import broken_and_clip_axes
     from break_axes import scale_axes
@@ -138,6 +470,47 @@ def add_break(ax, xranges=None, yranges=None):
 
 
 def plot_contacts(ax, contacts, cmap, x_shift, y_shift, **kwargs):
+    """
+    Display a 2-D contact matrix as a raster image on an axis.
+
+    Wraps ``ax.imshow`` to render a square or rectangular NumPy array
+    with its origin at the bottom-left, offset by the specified shifts.
+    Designed for contact maps (e.g., Hi-C, distance matrices) where
+    axis coordinates must align with external data indices.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        The target axes on which the contact matrix will be displayed.
+    contacts : numpy.ndarray, shape (Nx, Ny)
+        2-D array of contact values. ``Nx`` sets the x-extent and
+        ``Ny`` sets the y-extent of the displayed image.
+    cmap : str or matplotlib.colors.Colormap
+        Colormap applied to the contact values
+        (e.g., ``'hot_r'``, ``'RdBu_r'``).
+    x_shift : float
+        Offset applied to the left and right edges of the image extent,
+        shifting the entire matrix along the x-axis.
+    y_shift : float
+        Offset applied to the bottom and top edges of the image extent,
+        shifting the entire matrix along the y-axis.
+    **kwargs
+        Additional keyword arguments forwarded to ``ax.imshow``
+        (e.g., ``vmin``, ``vmax``, ``norm``, ``interpolation``).
+
+    Returns
+    -------
+    im : matplotlib.image.AxesImage
+        The ``AxesImage`` object returned by ``ax.imshow``, which can
+        be passed to ``plt.colorbar`` for a color scale.
+
+    Examples
+    --------
+    >>> matrix = np.random.rand(100, 100)
+    >>> fig, axs = general_temp(1, 1, 6, 5)
+    >>> im = plot_contacts(axs, matrix, cmap='hot_r', x_shift=0, y_shift=0)
+    >>> fig.colorbar(im, ax=axs, label='Contact frequency')
+    """
     Nx = contacts.shape[0]
     Ny = contacts.shape[1]
     im = ax.imshow(contacts, origin='lower', extent=[x_shift, Nx+x_shift, y_shift, Ny+y_shift], cmap=cmap, **kwargs)
