@@ -1,7 +1,7 @@
 Utils Module
 ============
 
-.. automodule:: scikit.utils
+.. automodule:: SciKit.utils
    :members:
    :undoc-members:
    :show-inheritance:

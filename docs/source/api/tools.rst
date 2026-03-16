@@ -1,7 +1,7 @@
 Tools Module
 ============
 
-.. automodule:: scikit.tools
+.. automodule:: SciKit.tools
    :members:
    :undoc-members:
    :show-inheritance:

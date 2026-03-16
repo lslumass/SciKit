@@ -1,7 +1,7 @@
 Analysis Module
 ===============
 
-.. automodule:: scikit.Analysis
+.. automodule:: SciKit.Analysis
    :members:
    :undoc-members:
    :show-inheritance:

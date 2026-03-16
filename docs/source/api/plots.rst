@@ -1,7 +1,7 @@
 Plots Module
 ============
 
-.. automodule:: scikit.plots
+.. automodule:: SciKit.plots
    :members:
    :undoc-members:
    :show-inheritance:
