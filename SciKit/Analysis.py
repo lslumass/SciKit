@@ -1,24 +1,59 @@
 #!/usr/bin/env python3
 """
-Analysis.py
-===========
-Unified MD analysis toolkit — scikit-style package.
+Analysis Module
+===============
+Unified MD trajectory analysis toolkit for the SciKit package.
 
-All analyses are exposed as Typer sub-commands through a single ``app``:
+All eight analyses are registered as sub-commands of the ``scical`` CLI
+entry-point (powered by `Typer <https://typer.tiangolo.com>`_).  Each command
+reads a topology and (optionally) a trajectory file, runs the analysis in
+parallel where supported, and writes results to plain-text ``.dat`` or NumPy
+``.npy`` files.
 
-    python Analysis.py --help
-    python Analysis.py msd        --top conf.psf --traj system.xtc
-    python Analysis.py rg         --top conf.psf --traj system.xtc
-    python Analysis.py dssp       --top conf.psf --traj system.xtc
-    python Analysis.py distance   --top conf.psf --traj system.dcd  -f pairs.dat
-    python Analysis.py distance-acf  --top conf.psf --traj system.xtc --pairs pairs.dat
-    python Analysis.py vector-acf    --top conf.psf --traj system.xtc --pairs pairs.dat
-    python Analysis.py contacts      --top system.psf --traj traj.dcd
-    python Analysis.py aggr          --top conf.psf --traj system.xtc
+Get started — list all commands and options::
 
-Requires
---------
-    mdanalysis  typer  numpy  scipy
+    scical --help
+
+Per-command help::
+
+    scical msd --help
+    scical rg --help
+    scical dssp --help
+    scical distance --help
+    scical distance-acf --help
+    scical vector-acf --help
+    scical contacts --help
+    scical aggr --help
+
+Available commands
+------------------
+
+.. list-table::
+   :widths: 25 75
+   :header-rows: 1
+
+   * - Command
+     - Description
+   * - ``msd``
+     - Per-segment Cα mean squared displacement (FFT, parallel)
+   * - ``rg``
+     - Per-segment radius of gyration time series
+   * - ``dssp``
+     - Per-residue DSSP helicity and β-sheet content
+   * - ``distance``
+     - Cα–Cα distances for user-defined residue pairs over a trajectory
+   * - ``distance-acf``
+     - Normalised fluctuation ACF of inter-Cα distances
+   * - ``vector-acf``
+     - End-to-end Cα vector autocorrelation function
+   * - ``contacts``
+     - Intra- and inter-chain heavy-atom contact maps (parallel)
+   * - ``aggr``
+     - Aggregation analysis: clustering, PBC recentering, radial density
+
+Dependencies
+------------
+mdanalysis, typer, numpy, scipy
 """
 
 from __future__ import annotations
@@ -59,7 +94,18 @@ app = typer.Typer(
 # =============================================================================
 
 def _traj_stop(stop: int) -> Optional[int]:
-    """Convert CLI stop=-1 sentinel to None (MDA reads to the end)."""
+    """Convert the CLI ``stop=-1`` sentinel to ``None`` for MDAnalysis slicing.
+
+    MDAnalysis trajectory slices use ``None`` to mean "read to the last frame".
+    The CLI exposes ``-1`` as the user-facing sentinel because ``Optional[int]``
+    defaults require a concrete value.
+
+    Args:
+        stop (int): Frame index supplied by the user, or ``-1`` to mean "end".
+
+    Returns:
+        Optional[int]: ``None`` if *stop* is ``-1``, otherwise *stop* unchanged.
+    """
     return None if stop == -1 else stop
 
 
@@ -68,7 +114,38 @@ def _traj_stop(stop: int) -> Optional[int]:
 # =============================================================================
 
 def _msd_worker(args: tuple):
-    """Subprocess worker: run EinsteinMSD for one segment."""
+    """Subprocess worker: compute EinsteinMSD for one chain segment.
+
+    Intended to be executed inside a ``ProcessPoolExecutor``.  Imports
+    MDAnalysis locally so that the module can be imported without the package
+    being installed in the parent process.
+
+    Args:
+        args (tuple): A packed argument tuple containing:
+
+            - **segid** (*str*) — Segment identifier (e.g. ``"PROA"``).
+            - **topology** (*str*) — Path to the topology file.
+            - **trajectory** (*str*) — Path to the trajectory file.
+            - **resid_range** (*Optional[str]*) — Residue range string
+              (e.g. ``"1:38"``), or ``None`` for the full segment.
+            - **start** (*int*) — Index of the first frame to analyse.
+            - **stop** (*int*) — Index of the last frame (``-1`` = end).
+            - **stride** (*int*) — Step between analysed frames.
+            - **outdir** (*str*) — Directory where output files are written.
+            - **per_residue** (*bool*) — Whether to write per-Cα MSD files.
+
+    Returns:
+        str: The *segid* that was processed, for logging in the parent process.
+
+    Raises:
+        ValueError: If no atoms match the constructed selection string.
+
+    Output files:
+        - ``<outdir>/<segid>_msd.dat`` — Two-column file: lag time (ps) and
+          total MSD (Å²).
+        - ``<outdir>/<segid>_CA_msd.dat`` — Per-Cα MSD file (only when
+          *per_residue* is ``True``).
+    """
     import MDAnalysis as mda
     import MDAnalysis.analysis.msd as msd_mod
 
@@ -129,7 +206,35 @@ def cmd_msd(
                                                help="Write per-Cα MSD files")] = False,
     nproc: Annotated[int, typer.Option("--nproc", help="Parallel workers")] = 4,
 ):
-    """Calculate per-segment Cα **mean squared displacement** (FFT method)."""
+    """Calculate per-segment Cα **mean squared displacement** (FFT method).
+
+    Iterates over all segments in the topology that contain matching Cα atoms
+    and dispatches each segment to a subprocess worker.  The MSD is computed
+    via the Einstein relation using MDAnalysis' ``EinsteinMSD`` with FFT
+    acceleration.
+
+    Args:
+        top (str): Path to the topology file (PSF, PDB, GRO, …).
+        traj (str): Path to the trajectory file (XTC, DCD, …).
+        resid (Optional[str]): Residue range to restrict the Cα selection,
+            e.g. ``"1:38"``.  When omitted the full segment is used.
+        outdir (str): Output directory; created automatically if absent.
+        start (int): Index of the first trajectory frame to include.
+        stop (int): Index of the last trajectory frame; ``-1`` means end.
+        stride (int): Step between analysed frames.
+        per_residue (bool): When ``True``, also write per-Cα MSD files.
+        nproc (int): Number of parallel worker processes.
+
+    Output:
+        ``<outdir>/<segid>_msd.dat`` — two columns: lag time (ps) and MSD (Å²).
+        ``<outdir>/<segid>_CA_msd.dat`` — per-Cα MSD table (``--per-residue`` only).
+
+    Example:
+        .. code-block:: bash
+
+            scical msd --top conf.psf --traj system.xtc \\
+                --resid 1:50 --outdir ./msd_results --nproc 8
+    """
     import MDAnalysis as mda
 
     os.makedirs(outdir, exist_ok=True)
@@ -176,7 +281,29 @@ def cmd_msd(
 # =============================================================================
 
 def _rg_worker(args: tuple):
-    """Subprocess worker: compute Rg time series for one segment."""
+    """Subprocess worker: compute radius-of-gyration time series for one segment.
+
+    Selects protein atoms (and optionally a residue sub-range) in the given
+    segment and evaluates ``AtomGroup.radius_of_gyration()`` frame by frame.
+
+    Args:
+        args (tuple): A packed argument tuple containing:
+
+            - **segid** (*str*) — Segment identifier.
+            - **topology** (*str*) — Path to the topology file.
+            - **trajectory** (*str*) — Path to the trajectory file.
+            - **resid_range** (*Optional[str]*) — Residue range string, or
+              ``None`` for the full protein segment.
+            - **start** (*int*) — First frame index.
+            - **stop** (*int*) — Last frame index (``-1`` = end).
+            - **stride** (*int*) — Frame stride.
+
+    Returns:
+        tuple[str, Optional[np.ndarray]]: A ``(segid, rg_array)`` pair, where
+        *rg_array* has shape ``(n_frames,)`` in ångström units.
+        Returns ``(segid, None)`` if no atoms matched or the trajectory slice
+        is empty.
+    """
     import MDAnalysis as mda
 
     segid, topology, trajectory, resid_range, start, stop, stride = args
@@ -210,7 +337,33 @@ def cmd_rg(
     stride: Annotated[int, typer.Option("--stride")] = 10,
     nproc: Annotated[int, typer.Option("--nproc")] = 4,
 ):
-    """Calculate per-segment **radius of gyration** time series."""
+    """Calculate per-segment **radius of gyration** time series.
+
+    Computes Rg(t) for every protein-containing segment in parallel and writes
+    a single multi-column ``.dat`` file with one column per segment, indexed
+    by frame number.
+
+    Args:
+        top (str): Path to the topology file.
+        traj (str): Path to the trajectory file.
+        resid (Optional[str]): Residue range to restrict the selection
+            (e.g. ``"1:100"``).  Omit to use the full protein.
+        out (str): Path for the output ``.dat`` file.
+        start (int): Index of the first trajectory frame.
+        stop (int): Index of the last trajectory frame; ``-1`` means end.
+        stride (int): Step between analysed frames.
+        nproc (int): Number of parallel worker processes.
+
+    Output:
+        ``<out>`` — space-separated columns: ``frame  <segid1>  <segid2>  …``
+        Units: frame index (dimensionless), Rg in ångström.
+
+    Example:
+        .. code-block:: bash
+
+            scical rg --top conf.psf --traj system.xtc \\
+                --out rg.dat --stride 5 --nproc 4
+    """
     import MDAnalysis as mda
 
     u = mda.Universe(top, traj)
@@ -261,7 +414,34 @@ def cmd_rg(
 # =============================================================================
 
 def _dssp_worker(args: tuple):
-    """Subprocess worker: run DSSP on one segment."""
+    """Subprocess worker: run DSSP secondary-structure assignment for one segment.
+
+    Uses ``MDAnalysis.analysis.dssp.DSSP`` to assign secondary structure
+    codes (``'H'`` = α-helix, ``'E'`` = β-strand, ``'C'`` = coil) to each
+    residue for every frame, then computes the per-residue helicity and
+    β-sheet occupancy as fractions over the analysed trajectory window.
+
+    Args:
+        args (tuple): A packed argument tuple containing:
+
+            - **segid** (*str*) — Segment identifier.
+            - **topology** (*str*) — Path to the topology file.
+            - **trajectory** (*str*) — Path to the trajectory file.
+            - **start** (*int*) — First frame index.
+            - **stop** (*int*) — Last frame index (``-1`` = end).
+            - **stride** (*int*) — Frame stride.
+
+    Returns:
+        tuple: ``(segid, resids, helicity, beta)`` where:
+
+        - **segid** (*str*) — The processed segment identifier.
+        - **resids** (*np.ndarray | None*) — 1-D array of residue IDs, or
+          ``None`` if no protein residues were found or no frames were analysed.
+        - **helicity** (*np.ndarray | None*) — Per-residue helix fraction in
+          ``[0, 1]``, shape ``(n_residues,)``.
+        - **beta** (*np.ndarray | None*) — Per-residue β-strand fraction in
+          ``[0, 1]``, shape ``(n_residues,)``.
+    """
     import MDAnalysis as mda
     from MDAnalysis.analysis.dssp import DSSP
 
@@ -289,6 +469,22 @@ def _dssp_worker(args: tuple):
 
 
 def _write_dssp_dat(output_file, all_resids, values_by_seg, segids):
+    """Write a DSSP occupancy table to a space-separated ``.dat`` file.
+
+    Constructs a matrix with rows = residues (union across all segments) and
+    columns = segments.  Missing residues for a given segment are filled with
+    ``NaN``.
+
+    Args:
+        output_file (str): Path to the output file.
+        all_resids (list[int]): Complete set of residue IDs (across all
+            segments) to include as rows.
+        values_by_seg (list[tuple]): List of ``(resids, values)`` tuples, one
+            per segment, where *resids* and *values* are 1-D arrays of the
+            same length.
+        segids (list[str]): Ordered list of segment identifiers used as column
+            headers.
+    """
     all_res_sorted = np.array(sorted(set(all_resids)))
     n_res, n_seg   = len(all_res_sorted), len(segids)
     mat            = np.full((n_res, n_seg), np.nan)
@@ -320,7 +516,35 @@ def cmd_dssp(
     stride: Annotated[int, typer.Option("--stride")] = 10,
     nproc: Annotated[int, typer.Option("--nproc")] = 4,
 ):
-    """Calculate per-residue **DSSP** helicity and beta-sheet content."""
+    """Calculate per-residue **DSSP** helicity and beta-sheet content.
+
+    Assigns DSSP secondary-structure codes to every protein residue in every
+    analysed frame using MDAnalysis' built-in DSSP implementation.
+    Per-residue fractions are averaged over time and written to two separate
+    files — one for helicity (``'H'`` codes) and one for β-sheet content
+    (``'E'`` codes).
+
+    Args:
+        top (str): Path to the topology file.
+        traj (str): Path to the trajectory file.
+        hout (str): Output path for the per-residue helicity table.
+        bout (str): Output path for the per-residue β-sheet table.
+        start (int): Index of the first trajectory frame.
+        stop (int): Index of the last trajectory frame; ``-1`` means end.
+        stride (int): Step between analysed frames.
+        nproc (int): Number of parallel worker processes.
+
+    Output:
+        ``<hout>`` and ``<bout>`` — space-separated tables:
+        ``residue  <segid1>  <segid2>  …``
+        Values are per-residue helix / β-strand occupancy fractions in [0, 1].
+
+    Example:
+        .. code-block:: bash
+
+            scical dssp --top conf.psf --traj system.xtc \\
+                --hout helicity.dat --bout beta.dat --stride 10 --nproc 4
+    """
     import MDAnalysis as mda
 
     u        = mda.Universe(top, traj)
@@ -365,10 +589,30 @@ def cmd_dssp(
 # =============================================================================
 
 def _warn(msg: str):
+    """Print a warning message to stderr.
+
+    Args:
+        msg (str): Warning text to display (prefixed with ``[WARNING]``).
+    """
     print(f"[WARNING] {msg}", file=sys.stderr)
 
 
 def _load_pairs(filepath: str):
+    """Parse a residue-pair list file into a list of ``(resid1, segid1, resid2, segid2)`` tuples.
+
+    Each non-comment, non-blank line must contain exactly four fields
+    (comma- or whitespace-separated):
+    ``resid1  segid1  resid2  segid2``
+
+    Malformed lines emit a warning and are skipped; they do not raise.
+
+    Args:
+        filepath (str): Path to the pairs file.
+
+    Returns:
+        list[tuple[int, str, int, str]]: Parsed pairs in the order they appear
+        in the file.
+    """
     pairs = []
     with open(filepath) as fh:
         for lineno, raw in enumerate(fh, 1):
@@ -389,6 +633,23 @@ def _load_pairs(filepath: str):
 
 
 def _load_all_pairs(filepaths):
+    """Load and deduplicate residue pairs from one or more pair files.
+
+    Pairs that appear in more than one file are included only once in the
+    returned *all_pairs* list; the original per-file lists are preserved in
+    *file_pairs* for downstream per-file output.
+
+    Args:
+        filepaths (list[str]): Ordered list of pair-file paths to read.
+
+    Returns:
+        tuple[list, dict]:
+
+        - **all_pairs** — Deduplicated list of
+          ``(resid1, segid1, resid2, segid2)`` tuples.
+        - **file_pairs** — ``{filepath: [pairs]}`` mapping preserving the
+          original per-file pair lists (with duplicates).
+    """
     file_pairs, seen, all_pairs = {}, set(), []
     for fp in filepaths:
         pairs = _load_pairs(fp)
@@ -402,6 +663,21 @@ def _load_all_pairs(filepaths):
 
 
 def _resolve_frame_range(n_total, start, stop, stride):
+    """Clamp and validate a trajectory frame range.
+
+    Args:
+        n_total (int): Total number of frames in the trajectory.
+        start (Optional[int]): Requested start frame, or ``None`` for frame 0.
+        stop (Optional[int]): Requested stop frame (exclusive), or ``None``
+            for the last frame.
+        stride (int): Step between frames; clamped to at least 1.
+
+    Returns:
+        tuple[int, int, int]: The validated ``(start, stop, stride)`` triple.
+
+    Raises:
+        ValueError: If the resolved *start* is greater than or equal to *stop*.
+    """
     start  = max(0, start if start is not None else 0)
     stop   = min(n_total, stop if stop is not None else n_total)
     stride = max(1, stride)
@@ -411,10 +687,33 @@ def _resolve_frame_range(n_total, start, stop, stride):
 
 
 def _n_selected_frames(start, stop, stride):
+    """Return the number of frames in the slice ``[start:stop:stride]``.
+
+    Args:
+        start (int): First frame index (inclusive).
+        stop (int): Last frame index (exclusive).
+        stride (int): Step between frames.
+
+    Returns:
+        int: Number of frames selected; ``0`` if the range is empty.
+    """
     return max(0, (stop - start + stride - 1) // stride)
 
 
 def _make_worker_slices(start, stop, stride, n_workers):
+    """Partition a frame range into roughly equal sub-slices for parallel workers.
+
+    Args:
+        start (int): First frame index (inclusive).
+        stop (int): Last frame index (exclusive).
+        stride (int): Step between frames.
+        n_workers (int): Desired number of worker processes; clamped to the
+            actual number of selected frames if fewer frames are available.
+
+    Returns:
+        list[tuple[int, int, int]]: List of ``(w_start, w_stop, stride)``
+        tuples, one per worker.  Empty chunks are omitted.
+    """
     sel      = np.arange(start, stop, stride)
     n_actual = min(n_workers, len(sel))
     slices   = []
@@ -426,6 +725,26 @@ def _make_worker_slices(start, stop, stride, n_workers):
 
 
 def _resolve_ca_indices(universe, pairs):
+    """Resolve Cα atom indices for a list of residue pairs.
+
+    For each unique ``(resid, segid)`` key encountered in *pairs*, selects
+    the corresponding Cα atom from *universe* and records its global atom
+    index.  The result is two parallel lists of indices that can be passed
+    directly to NumPy distance calculations.
+
+    Args:
+        universe (MDAnalysis.Universe): Loaded MDAnalysis Universe.
+        pairs (list[tuple[int, str, int, str]]): List of
+            ``(resid1, segid1, resid2, segid2)`` tuples.
+
+    Returns:
+        tuple[list[int], list[int]]: Two parallel lists — *idx1* and *idx2* —
+        each of length ``len(pairs)``, containing the global atom indices of
+        the first and second Cα atoms in each pair.
+
+    Raises:
+        ValueError: If a ``(resid, segid)`` key matches no Cα atom.
+    """
     import MDAnalysis as mda
     unique_res = {}
     for r1, s1, r2, s2 in pairs:
@@ -443,6 +762,29 @@ def _resolve_ca_indices(universe, pairs):
 
 
 def _dist_worker(args):
+    """Subprocess worker: compute pairwise Cα distances over a trajectory sub-slice.
+
+    Loads its own MDAnalysis Universe and iterates over the assigned frame
+    window, accumulating distances into a pre-allocated buffer for efficiency.
+
+    Args:
+        args (tuple): A packed argument tuple containing:
+
+            - **topology** (*str*) — Path to the topology file.
+            - **trajectory** (*str*) — Path to the trajectory file.
+            - **idx1** (*list[int]*) — Global atom indices for the first atoms
+              of each pair.
+            - **idx2** (*list[int]*) — Global atom indices for the second atoms
+              of each pair.
+            - **traj_slice** (*tuple[int, int, int]*) — ``(start, stop, stride)``
+              for this worker's frame window.
+            - **worker_id** (*int*) — Zero-based worker index for logging.
+
+    Returns:
+        tuple[list[int], np.ndarray]: ``(frames, distances)`` where *frames*
+        is a list of absolute trajectory frame numbers and *distances* has
+        shape ``(n_pairs, n_frames)`` with values in ångström.
+    """
     import MDAnalysis as mda
     topology, trajectory, idx1, idx2, traj_slice, worker_id = args
     w_start, w_stop, stride = traj_slice
@@ -465,6 +807,21 @@ def _dist_worker(args):
 
 
 def _write_dist_output(out_path, pairs, dist_block, all_frames):
+    """Write a pairwise distance matrix to a CSV-style ``.dat`` file.
+
+    The output has one row per pair and one column per trajectory frame.
+    The header line lists each frame number.  The first four columns identify
+    the pair: ``resid_1, segid_1, resid_2, segid_2``.
+
+    Args:
+        out_path (str): Destination file path.
+        pairs (list[tuple]): List of ``(resid1, segid1, resid2, segid2)``
+            tuples — one per row.
+        dist_block (np.ndarray): Distance matrix of shape
+            ``(n_pairs, n_frames)`` in ångström.
+        all_frames (list[int]): Ordered list of trajectory frame numbers
+            corresponding to the columns of *dist_block*.
+    """
     float_buf = io.StringIO()
     np.savetxt(float_buf, dist_block, fmt="%.4f", delimiter=", ")
     float_buf.seek(0)
@@ -488,7 +845,42 @@ def cmd_dist(
     workers: Annotated[int, typer.Option("-n", "--workers",
                help="Parallel worker processes")] = max(1, cpu_count() or 1),
 ):
-    """Calculate **Cα–Cα distances** for residue pairs over a trajectory."""
+    """Calculate **Cα–Cα distances** for residue pairs over a trajectory.
+
+    Reads one or more pair-list files, resolves the corresponding Cα atom
+    indices, and distributes the trajectory frames across parallel workers.
+    Results are assembled and written to a ``_distance.dat`` file placed
+    alongside each input pair file.
+
+    **Pair file format** (comma- or whitespace-separated, ``#`` comments allowed)::
+
+        resid1  segid1  resid2  segid2
+        10      PROA    45      PROA
+        10      PROA    45      PROB
+
+    Args:
+        top (str): Path to the topology file.
+        traj (str): Path to the trajectory file.
+        pair_files (List[str]): One or more residue-pair list files.
+            Duplicate pairs across files are computed only once.
+        start (Optional[int]): First trajectory frame to include
+            (``None`` = frame 0).
+        stop (Optional[int]): Last trajectory frame, exclusive
+            (``None`` = last frame).
+        stride (int): Step between analysed frames.
+        workers (int): Number of parallel worker processes; defaults to the
+            number of logical CPU cores.
+
+    Output:
+        ``<pair_file_stem>_distance.dat`` — one row per pair, one column per
+        frame, prefixed by ``resid_1, segid_1, resid_2, segid_2``.
+
+    Example:
+        .. code-block:: bash
+
+            scical distance --top conf.psf --traj system.dcd \\
+                -f pairs.dat --stride 2 --workers 8
+    """
     import MDAnalysis as mda
 
     typer.echo("=" * 60)
@@ -546,7 +938,18 @@ def cmd_dist(
 # =============================================================================
 
 def _autocorr_fft_scalar(x: np.ndarray) -> np.ndarray:
-    """Normalised fluctuation ACF of a 1-D scalar series via FFT."""
+    """Compute the normalised fluctuation autocorrelation function of a scalar time series.
+
+    Uses the Wiener–Khinchin theorem (FFT-based) with bias correction for
+    the varying number of available pairs at each lag.  The zero-lag value
+    is normalised to 1.
+
+    Args:
+        x (np.ndarray): 1-D array of scalar observations, shape ``(N,)``.
+
+    Returns:
+        np.ndarray: Normalised ACF, shape ``(N,)``, with ``result[0] == 1.0``.
+    """
     N   = len(x)
     xm  = x - x.mean()
     fx  = np.fft.fft(xm, n=2 * N)
@@ -556,6 +959,31 @@ def _autocorr_fft_scalar(x: np.ndarray) -> np.ndarray:
 
 
 def _dist_acf_worker(args: tuple):
+    """Subprocess worker: compute the distance ACF for one residue pair.
+
+    Extracts the Cα–Cα distance time series for the given pair and applies
+    :func:`_autocorr_fft_scalar` to obtain the normalised fluctuation ACF.
+
+    Args:
+        args (tuple): A packed argument tuple containing:
+
+            - **label** (*str*) — Human-readable pair label
+              (``"segid1:resid1-segid2:resid2"``).
+            - **topology** (*str*) — Path to the topology file.
+            - **trajectory** (*str*) — Path to the trajectory file.
+            - **resid1** (*str*) — Residue ID of the first atom.
+            - **segid1** (*str*) — Segment ID of the first atom.
+            - **resid2** (*str*) — Residue ID of the second atom.
+            - **segid2** (*str*) — Segment ID of the second atom.
+            - **start** (*int*) — First frame index.
+            - **stop** (*int*) — Last frame index (``-1`` = end).
+            - **stride** (*int*) — Frame stride.
+
+    Returns:
+        tuple[str, Optional[np.ndarray]]: ``(label, acf)`` where *acf* is a
+        1-D normalised ACF array, or ``None`` if atoms were not found or
+        fewer than 2 frames were available.
+    """
     import MDAnalysis as mda
 
     (label, topology, trajectory,
@@ -581,6 +1009,22 @@ def _dist_acf_worker(args: tuple):
 
 
 def _read_pairs_file(path: str) -> list:
+    """Read a residue-pair file and return a list of ``(resid1, segid1, resid2, segid2)`` tuples.
+
+    Lines beginning with ``#`` and blank lines are skipped.  Fields may be
+    comma- or whitespace-separated; only the first four tokens of each line
+    are used.
+
+    Args:
+        path (str): Path to the pairs file.
+
+    Returns:
+        list[tuple[str, str, str, str]]: Parsed pairs as strings (resids are
+        **not** cast to ``int`` here — the caller is responsible if needed).
+
+    Raises:
+        ValueError: If a data line contains fewer than four fields.
+    """
     pairs = []
     with open(path) as fh:
         for lineno, raw in enumerate(fh, 1):
@@ -596,10 +1040,36 @@ def _read_pairs_file(path: str) -> list:
 
 
 def _pair_label(r1, s1, r2, s2) -> str:
+    """Construct a compact human-readable label for a residue pair.
+
+    Args:
+        r1: Residue ID of the first residue.
+        s1: Segment ID of the first residue.
+        r2: Residue ID of the second residue.
+        s2: Segment ID of the second residue.
+
+    Returns:
+        str: Label formatted as ``"<s1>:<r1>-<s2>:<r2>"``.
+    """
     return f"{s1}:{r1}-{s2}:{r2}"
 
 
 def _save_acf(output_file, labels, C_all, topology, trajectory, stride):
+    """Write a collection of ACF curves to a space-separated ``.dat`` file.
+
+    All ACF arrays are truncated to the length of the shortest one before
+    writing.  The first column contains lag times in picoseconds (computed
+    from the trajectory time step and *stride*); subsequent columns contain
+    the ACF for each labelled pair.
+
+    Args:
+        output_file (str): Destination file path.
+        labels (list[str]): Column labels (one per ACF curve).
+        C_all (list[np.ndarray]): List of 1-D normalised ACF arrays.
+        topology (str): Path to the topology file (used to read ``dt``).
+        trajectory (str): Path to the trajectory file.
+        stride (int): Frame stride used when computing the ACF (scales ``dt``).
+    """
     import MDAnalysis as mda
     min_len = min(len(c) for c in C_all)
     C_all   = [c[:min_len] for c in C_all]
@@ -625,7 +1095,32 @@ def cmd_dist_acf(
     stride: Annotated[int, typer.Option("--stride")] = 10,
     nproc: Annotated[int, typer.Option("--nproc")] = 4,
 ):
-    """Compute inter-Cα **distance autocorrelation** for residue pairs."""
+    """Compute inter-Cα **distance autocorrelation** for residue pairs.
+
+    For each pair in *pairs*, extracts the Cα–Cα distance time series and
+    computes the normalised fluctuation ACF via FFT (Wiener–Khinchin theorem).
+    All ACF curves are written to a single ``.dat`` file.
+
+    Args:
+        top (str): Path to the topology file.
+        traj (str): Path to the trajectory file.
+        pairs (str): Path to the residue-pair list file.
+        out (str): Output file path for the ACF table.
+        start (int): First trajectory frame to include.
+        stop (int): Last trajectory frame; ``-1`` means end.
+        stride (int): Step between analysed frames (also scales the lag-time axis).
+        nproc (int): Number of parallel worker processes.
+
+    Output:
+        ``<out>`` — columns: lag time (ps), normalised ACF per pair.
+        The zero-lag value is normalised to 1.
+
+    Example:
+        .. code-block:: bash
+
+            scical distance-acf --top conf.psf --traj system.xtc \\
+                --pairs pairs.dat --out distance_acf.dat --stride 10 --nproc 4
+    """
     pair_list = _read_pairs_file(pairs)
     if not pair_list:
         typer.echo(f"[!] No valid pairs in {pairs}", err=True)
@@ -656,6 +1151,18 @@ def cmd_dist_acf(
 # =============================================================================
 
 def _raw_acf_1d(x: np.ndarray) -> np.ndarray:
+    """Compute the un-normalised, bias-corrected autocorrelation of a 1-D array.
+
+    Uses FFT via the Wiener–Khinchin theorem.  No mean subtraction is applied;
+    use :func:`_autocorr_fft_scalar` for fluctuation ACFs.
+
+    Args:
+        x (np.ndarray): 1-D input signal, shape ``(N,)``.
+
+    Returns:
+        np.ndarray: Bias-corrected ACF, shape ``(N,)``.  Element ``[0]`` is
+        the mean square of *x*.
+    """
     N   = len(x)
     fx  = np.fft.fft(x, n=2 * N)
     pwr = np.real(np.fft.ifft(fx * np.conj(fx)))[:N]
@@ -664,15 +1171,56 @@ def _raw_acf_1d(x: np.ndarray) -> np.ndarray:
 
 
 def _autocorr_fft_vector(R: np.ndarray) -> np.ndarray:
-    """
-    C(t) = [<Rx(0)Rx(t)> + <Ry(0)Ry(t)> + <Rz(0)Rz(t)>]
-           / <|R|^2>
+    """Compute the normalised vector autocorrelation function.
+
+    Evaluates
+
+    .. math::
+
+        C(t) = \\frac{\\langle R_x(0)R_x(t) \\rangle
+                     + \\langle R_y(0)R_y(t) \\rangle
+                     + \\langle R_z(0)R_z(t) \\rangle}
+                     {\\langle |\\mathbf{R}|^2 \\rangle}
+
+    where :math:`\\mathbf{R}(t)` is the end-to-end inter-Cα vector at time *t*.
+
+    Args:
+        R (np.ndarray): 2-D array of inter-residue vectors, shape
+            ``(n_frames, 3)``, in ångström.
+
+    Returns:
+        np.ndarray: Normalised vector ACF, shape ``(n_frames,)``, with
+        ``result[0] == 1.0``.
     """
     C = _raw_acf_1d(R[:, 0]) + _raw_acf_1d(R[:, 1]) + _raw_acf_1d(R[:, 2])
     return C / C[0]
 
 
 def _vec_acf_worker(args: tuple):
+    """Subprocess worker: compute the vector ACF for one residue pair.
+
+    Collects the inter-Cα displacement vector :math:`\\mathbf{R}(t)` over the
+    specified trajectory window and calls :func:`_autocorr_fft_vector`.
+
+    Args:
+        args (tuple): A packed argument tuple containing:
+
+            - **label** (*str*) — Human-readable pair label.
+            - **topology** (*str*) — Path to the topology file.
+            - **trajectory** (*str*) — Path to the trajectory file.
+            - **resid1** (*str*) — Residue ID of the first atom.
+            - **segid1** (*str*) — Segment ID of the first atom.
+            - **resid2** (*str*) — Residue ID of the second atom.
+            - **segid2** (*str*) — Segment ID of the second atom.
+            - **start** (*int*) — First frame index.
+            - **stop** (*int*) — Last frame index (``-1`` = end).
+            - **stride** (*int*) — Frame stride.
+
+    Returns:
+        tuple[str, Optional[np.ndarray]]: ``(label, acf)`` where *acf* is a
+        1-D normalised vector ACF, or ``None`` if atoms were not found or
+        fewer than 2 frames were available.
+    """
     import MDAnalysis as mda
 
     (label, topology, trajectory,
@@ -708,7 +1256,37 @@ def cmd_vector_acf(
     stride: Annotated[int, typer.Option("--stride")] = 10,
     nproc: Annotated[int, typer.Option("--nproc")] = 4,
 ):
-    """Compute end-to-end Cα **vector autocorrelation** for residue pairs."""
+    """Compute end-to-end Cα **vector autocorrelation** for residue pairs.
+
+    For each pair in *pairs*, collects the inter-Cα displacement vector
+    **R**(t) and computes the normalised vector ACF:
+
+    .. math::
+
+        C(t) = \\frac{\\langle \\mathbf{R}(0) \\cdot \\mathbf{R}(t) \\rangle}
+                     {\\langle |\\mathbf{R}|^2 \\rangle}
+
+    All ACF curves are written to a single ``.dat`` file.
+
+    Args:
+        top (str): Path to the topology file.
+        traj (str): Path to the trajectory file.
+        pairs (str): Path to the residue-pair list file.
+        out (str): Output file path for the ACF table.
+        start (int): First trajectory frame to include.
+        stop (int): Last trajectory frame; ``-1`` means end.
+        stride (int): Step between analysed frames.
+        nproc (int): Number of parallel worker processes.
+
+    Output:
+        ``<out>`` — columns: lag time (ps), normalised vector ACF per pair.
+
+    Example:
+        .. code-block:: bash
+
+            scical vector-acf --top conf.psf --traj system.xtc \\
+                --pairs pairs.dat --out vector_acf.dat --stride 10 --nproc 4
+    """
     pair_list = _read_pairs_file(pairs)
     if not pair_list:
         typer.echo(f"[!] No valid pairs in {pairs}", err=True)
@@ -742,9 +1320,37 @@ def cmd_vector_acf(
 # =============================================================================
 
 HEAVY_ATOMS = "name CA CB CC CD CE CF"
+"""str: MDAnalysis selection string for common heavy side-chain atoms."""
 
 
 def _contacts_worker(args):
+    """Subprocess worker: accumulate intra- and inter-chain contact counts over assigned frames.
+
+    Uses ``MDAnalysis.lib.distances.capped_distance`` for efficient
+    neighbour-list construction.  Contacts are classified as *intra-chain*
+    (same segment, sequence separation ≥ 4 residues) or *inter-chain*
+    (different segments).  Each unique contact is counted once per frame.
+
+    Args:
+        args (tuple): A packed argument tuple containing:
+
+            - **top** (*str*) — Path to the topology file.
+            - **traj** (*Optional[str]*) — Path to the trajectory file, or
+              ``None`` for a single-frame topology.
+            - **cutoff** (*float*) — Distance cutoff in ångström.
+            - **frame_indices** (*list[int]*) — Absolute frame indices to
+              process in this worker.
+            - **atom_to_local** (*np.ndarray[int32]*) — Maps each heavy-atom
+              index to its local residue index within its chain copy.
+            - **atom_to_copy** (*np.ndarray[int32]*) — Maps each heavy-atom
+              index to its chain-copy index.
+            - **N** (*int*) — Number of residues per chain copy.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: ``(intra_sum, inter_sum)`` — two
+        ``(N, N)`` float64 arrays accumulating the raw contact counts for
+        the assigned frames.
+    """
     import MDAnalysis as mda
     from MDAnalysis.lib.distances import capped_distance
 
@@ -801,7 +1407,42 @@ def cmd_contacts(
     nproc: Annotated[int, typer.Option("--nproc")] = 1,
     out: Annotated[str, typer.Option("--out", help="Output stem (appended with _intra/_inter)")] = "contact_map.npy",
 ):
-    """Calculate intra- and inter-chain **contact maps** (heavy-atom, parallel)."""
+    """Calculate intra- and inter-chain **contact maps** (heavy-atom, parallel).
+
+    Identifies contacts between heavy atoms (CA, CB, CC, CD, CE, CF) within
+    a user-defined distance cutoff, accounting for periodic boundary conditions.
+    Contacts are classified as:
+
+    - **Intra-chain** — same segment, sequence separation ≥ 4 residues.
+    - **Inter-chain** — atoms from different segment copies.
+
+    All chain copies must have the same number of residues.  Contact frequency
+    (contacts per frame per copy) is written as NumPy ``.npy`` files.
+
+    Args:
+        top (str): Path to the topology file.
+        traj (Optional[str]): Path to the trajectory file.  When omitted,
+            only the single frame in *top* is analysed.
+        cutoff (float): Heavy-atom distance cutoff in ångström.
+        start (int): Index of the first trajectory frame.
+        stop (Optional[int]): Index of the last trajectory frame (exclusive);
+            ``None`` means use all frames.
+        stride (int): Step between analysed frames.
+        nproc (int): Number of parallel worker processes.
+        out (str): Output file stem — four files are written:
+            ``<stem>_intra.npy``, ``<stem>_inter.npy``, ``<stem>.npy``
+            (combined), and ``<stem>_resids.npy``.
+
+    Output:
+        Four NumPy binary files: ``<stem>_intra.npy``, ``<stem>_inter.npy``,
+        ``<stem>.npy`` (combined), and ``<stem>_resids.npy``.
+
+    Example:
+        .. code-block:: bash
+
+            scical contacts --top system.psf --traj traj.dcd \\
+                --cutoff 8.0 --stride 5 --nproc 8 --out contacts
+    """
     import MDAnalysis as mda
 
     warnings.filterwarnings("ignore")
@@ -885,16 +1526,48 @@ def cmd_contacts(
 # =============================================================================
 
 AVOGADRO = 6.022e23
+"""float: Avogadro's number (mol⁻¹), used for concentration unit conversion."""
 
 
 def _load_universe(top: str, traj: Optional[str] = None):
-    """Helper: load a Universe with or without a trajectory."""
+    """Load an MDAnalysis Universe with or without a trajectory.
+
+    A convenience wrapper that handles the single-frame (topology-only) case
+    transparently.
+
+    Args:
+        top (str): Path to the topology file.
+        traj (Optional[str]): Path to the trajectory file, or ``None`` to
+            load only the single frame embedded in *top*.
+
+    Returns:
+        MDAnalysis.Universe: The loaded Universe object.
+    """
     import MDAnalysis as mda
     return mda.Universe(top, traj) if traj else mda.Universe(top)
 
 
 def _grp_init(u, ref_atom: str = "CA", step: int = 1):
-    """Initialise per-segment atom groups for clustering."""
+    """Initialise per-segment reference-atom groups for clustering.
+
+    Creates one ``AtomGroup`` per segment, containing every *step*-th
+    occurrence of *ref_atom* within that segment.  Each group is assigned
+    an integer group ID equal to its segment index.
+
+    Args:
+        u (MDAnalysis.Universe): Loaded Universe.
+        ref_atom (str): Name of the reference atom (default: ``"CA"``; use
+            ``"P"`` for nucleic acid backbones).
+        step (int): Sub-sampling step applied within each segment's reference
+            atoms (e.g. ``step=2`` uses every other Cα for faster clustering).
+
+    Returns:
+        tuple[list[AtomGroup], np.ndarray]:
+
+        - **segs** — List of ``AtomGroup`` objects, one per segment.
+        - **grps** — Integer array of initial group IDs, shape
+          ``(n_segments,)``.
+    """
     segs, grps = [], []
     for i, segid in enumerate(u.segments):
         cas = u.select_atoms(f"segid {segid.segid} and name {ref_atom}")
@@ -905,16 +1578,28 @@ def _grp_init(u, ref_atom: str = "CA", step: int = 1):
 
 
 def _find_clusters_and_stats(segs, grps, r_cutoff: float = 8.0):
-    """
-    Union-find style cluster detection using kd-tree contact search.
+    """Detect aggregation clusters using a union-find approach with kd-tree contact search.
 
-    Returns
-    -------
-    clusters       : list of lists — each inner list holds segment indices
-    monomer        : int  — number of isolated segments
-    n_clusters     : int  — number of multi-segment clusters
-    max_cluster_size : int
-    grps           : updated group-ID array
+    Two segments are considered to be in the same cluster if any atom in one
+    segment lies within *r_cutoff* of any atom in the other.  Group labels
+    are propagated using a greedy union-find loop (single-pass; not the
+    full two-pass path-compressed variant).
+
+    Args:
+        segs (list[AtomGroup]): Reference-atom groups, one per segment
+            (from :func:`_grp_init`).
+        grps (np.ndarray): Initial group-ID array of shape ``(n_segments,)``.
+        r_cutoff (float): Contact distance cutoff in ångström.
+
+    Returns:
+        tuple:
+
+        - **clusters** (*list[list[int]]*) — List of clusters; each cluster is
+          a list of segment indices that belong to it.
+        - **monomer** (*int*) — Number of isolated single-segment clusters.
+        - **n_clusters** (*int*) — Number of multi-segment clusters.
+        - **max_cluster_size** (*int*) — Size (in segments) of the largest cluster.
+        - **grps** (*np.ndarray*) — Updated group-ID array after merging.
     """
     nmol = len(segs)
     grps = grps.copy()
@@ -929,7 +1614,7 @@ def _find_clusters_and_stats(segs, grps, r_cutoff: float = 8.0):
             neighbors = tree_i.query_ball_tree(cKDTree(segs[j].positions), r=r_cutoff)
             if any(len(nb) > 0 for nb in neighbors):
                 grps = np.where(grps == grp_j, grp_i, grps)
-                grp_i = grps[i]   # may have been relabelled
+                grp_i = grps[i]
 
     aggr = {}
     for g in grps:
@@ -947,9 +1632,24 @@ def _find_clusters_and_stats(segs, grps, r_cutoff: float = 8.0):
 
 
 def _unwrap_cluster(u, cluster_seg_indices: list, box: np.ndarray) -> dict:
-    """
-    BFS unwrap of a cluster split across periodic boundaries.
-    Returns {seg_idx: shift_vector} for every segment in the cluster.
+    """Unwrap a cluster that is split across periodic boundaries using BFS.
+
+    Starting from the first segment in *cluster_seg_indices* as the reference,
+    each subsequent segment is shifted by the nearest periodic image so that
+    all segments are in the same image as the reference.
+
+    Args:
+        u (MDAnalysis.Universe): Universe at the current trajectory frame.
+        cluster_seg_indices (list[int]): Indices of segments belonging to the
+            cluster (as integers into ``u.segments``).
+        box (np.ndarray): Simulation cell dimensions, shape ``(6,)`` —
+            ``[Lx, Ly, Lz, alpha, beta, gamma]``.
+
+    Returns:
+        dict[int, np.ndarray]: Mapping ``{seg_index: shift_vector}`` where
+        each shift vector (shape ``(3,)``) should be *added* to the atom
+        positions of that segment to place it in the same image as the
+        reference segment.
     """
     box_half = box[:3] / 2.0
     shifts   = {cluster_seg_indices[0]: np.zeros(3)}
@@ -979,11 +1679,23 @@ def _unwrap_cluster(u, cluster_seg_indices: list, box: np.ndarray) -> dict:
 
 
 def _recenter_frame(u, largest_cluster: list, box: np.ndarray) -> np.ndarray:
-    """
-    Unwrap the largest cluster, translate its CoM to the box centre,
-    then wrap every atom back into the primary cell.
+    """Unwrap the largest cluster, translate its centre of mass to the box centre, and re-wrap.
 
-    Returns a new position array for u.atoms (does not mutate u in-place).
+    Applies :func:`_unwrap_cluster` to the largest cluster, shifts all atoms
+    so that the cluster CoM coincides with the centre of the simulation box,
+    then folds every atom back into the primary periodic cell using modular
+    arithmetic.
+
+    Args:
+        u (MDAnalysis.Universe): Universe at the current trajectory frame.
+        largest_cluster (list[int]): Segment indices belonging to the largest
+            cluster (as returned by :func:`_find_clusters_and_stats`).
+        box (np.ndarray): Simulation cell dimensions, shape ``(6,)``.
+
+    Returns:
+        np.ndarray: New position array for all atoms in *u*, shape
+        ``(n_atoms, 3)``.  The Universe is **not** mutated; the caller is
+        responsible for assigning the result to ``u.atoms.positions``.
     """
     box_center   = box[:3] / 2.0
     shifts       = _unwrap_cluster(u, largest_cluster, box)
@@ -1009,13 +1721,28 @@ def _recenter_frame(u, largest_cluster: list, box: np.ndarray) -> np.ndarray:
 def _radial_density(u, droplet_center: np.ndarray, ca_per_segment: int,
                     ref_atom: str = "CA",
                     r_max: float = 100.0, dr: float = 1.0) -> tuple:
-    """
-    Radial monomer concentration profile (mM) centred on *droplet_center*.
+    """Compute the radial monomer concentration profile centred on a droplet.
 
-    Returns
-    -------
-    r_bins          : ndarray (n_bins,)  — bin centres in Å
-    concentration   : ndarray (n_bins,)  — concentration in mM
+    Bins all reference atoms by their distance from *droplet_center*, divides
+    by the shell volume and the number of reference atoms per monomer to
+    obtain a concentration in millimolar.
+
+    Args:
+        u (MDAnalysis.Universe): Universe at the current (recentered) frame.
+        droplet_center (np.ndarray): 3-D Cartesian coordinates of the droplet
+            centre, in ångström.
+        ca_per_segment (int): Number of reference atoms per monomer (chain
+            copy), used to convert atom counts to monomer counts.
+        ref_atom (str): Reference atom name (default: ``"CA"``).
+        r_max (float): Maximum radius for the profile, in ångström.
+        dr (float): Radial bin width, in ångström.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]:
+
+        - **r_bins** — Bin centres, shape ``(n_bins,)``, in ångström.
+        - **concentration** — Monomer concentration per shell, shape
+          ``(n_bins,)``, in mM.
     """
     all_ca    = u.select_atoms(f"name {ref_atom}")
     distances = np.linalg.norm(all_ca.positions - droplet_center, axis=1)
@@ -1053,20 +1780,56 @@ def cmd_aggr(
     n_frames_avg: Annotated[int, typer.Option("--n-frames-avg",
                   help="Number of last frames averaged for the density profile")] = 50,
 ):
-    """
-    Analyse protein **aggregation**: cluster detection, optional PBC recentering,
-    and radial monomer concentration profile.
+    """Analyse protein **aggregation**: cluster detection, PBC recentering, and radial density.
 
-    Clusters are identified by kd-tree contact search on the chosen reference
-    atoms (default: Cα).  Each frame produces counts of monomers, multi-chain
-    clusters, and the largest cluster size.
+    Processes each trajectory frame to:
 
-    With **--recenter** the largest cluster is unwrapped across PBC and
-    translated to the box centre; the result is written as a new trajectory.
+    1. **Cluster** — detect multi-chain aggregates using kd-tree contact search
+       on reference atoms (default: Cα), with a union-find merging scheme.
+    2. **Recenter** *(optional, ``--recenter``)* — unwrap the largest cluster
+       across PBC and translate it to the box centre; write as a new trajectory.
+    3. **Density profile** *(optional, ``--density``, requires ``--recenter``)* —
+       compute and average the radial monomer concentration (mM) over the last
+       *n-frames-avg* frames.
 
-    With **--density** (requires **--recenter**) the radial monomer
-    concentration (mM) is averaged over the last *n-frames-avg* frames and
-    written to *profile*.
+    Args:
+        top (str): Path to the topology file (PSF).
+        traj (str): Path to the trajectory file.
+        out (str): Output path for per-frame aggregation statistics.
+        outtraj (str): Output path for the recentered trajectory
+            (written only with ``--recenter``).
+        profile (str): Output path for the radial density profile
+            (written only with ``--density``).
+        ref (str): Reference atom for clustering and density. Use ``"CA"``
+            for peptides and ``"P"`` for nucleic acids.
+        rcut (float): Distance cutoff (Å) for defining inter-segment contact.
+        castep (int): Sub-sampling step applied to reference atoms during
+            clustering (``1`` = all atoms; larger values trade accuracy for speed).
+        start (Optional[int]): First frame to analyse (``None`` = 0).
+        stop (Optional[int]): Last frame, exclusive (``None`` = last frame).
+        stride (int): Step between analysed frames.
+        recenter (bool): Unwrap and recenter the largest cluster each frame.
+        density (bool): Compute the radial monomer concentration profile
+            (requires ``--recenter``).
+        dr (float): Radial bin width (Å) for the density profile.
+        n_frames_avg (int): Number of final frames to average for the profile.
+
+    Output:
+        - ``<out>`` — per-frame table: frame, monomers, clusters, largest size.
+        - ``<outtraj>`` — recentered trajectory (``--recenter`` only).
+        - ``<profile>`` — radial density: radius (Å), mean (mM), std dev (mM)
+          (``--density`` only).
+
+    Example:
+        .. code-block:: bash
+
+            # Cluster statistics only
+            scical aggr --top conf.psf --traj system.xtc --rcut 8.0
+
+            # With PBC recentering and radial density profile
+            scical aggr --top conf.psf --traj system.xtc \\
+                --rcut 8.0 --recenter --density --dr 2.0 \\
+                --n-frames-avg 100 --outtraj recentered.xtc
     """
     import MDAnalysis as mda
 
@@ -1141,14 +1904,12 @@ def cmd_aggr(
         if writer is not None:
             writer.close()
 
-    # ── Write aggregation statistics ────────────────────────────────────────
     typer.echo(f"\nWriting aggregation statistics -> {out}")
     with open(out, "w") as fh:
         fh.write("# Frame  Monomers  Clusters  LargestClusterSize\n")
         for frame, monomer, n_clusters, max_size in stats_data:
             fh.write(f"{frame}  {monomer}  {n_clusters}  {max_size}\n")
 
-    # ── Write density profile ────────────────────────────────────────────────
     if density and density_profiles:
         avg_conc = np.mean(density_profiles, axis=0)
         std_conc = np.std(density_profiles,  axis=0)

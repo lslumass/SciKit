@@ -15,13 +15,7 @@ functions.
 Installation
 ------------
 
-Install SciKit via pip:
-
-.. code-block:: bash
-
-   pip install scikit
-
-Or install directly from source:
+Install SciKit from source:
 
 .. code-block:: bash
 
@@ -49,13 +43,13 @@ SciKit is organised into four modules, each with a clear responsibility:
 
    * - Module
      - Purpose
-   * - :mod:`scikit.Analysis`
-     - Core data analysis routines (statistics, signal processing, decomposition)
-   * - :mod:`scikit.plots`
+   * - :mod:`SciKit.Analysis`
+     - MD trajectory analysis exposed as CLI sub-commands (MSD, Rg, DSSP, distances, contacts, aggregation)
+   * - :mod:`SciKit.plots`
      - Ready-made Matplotlib figures for scientific data
-   * - :mod:`scikit.tools`
+   * - :mod:`SciKit.tools`
      - High-level workflow tools that combine analysis and plotting
-   * - :mod:`scikit.utils`
+   * - :mod:`SciKit.utils`
      - Shared helpers for I/O, data validation, and unit conversion
 
 ----
@@ -63,41 +57,158 @@ SciKit is organised into four modules, each with a clear responsibility:
 Analysis Module
 ---------------
 
-The :mod:`scikit.Analysis` module provides the core numerical routines.
-Import it as:
+The :mod:`SciKit.Analysis` module is a unified MD analysis toolkit.  All eight
+analyses are registered as sub-commands of a single ``scical`` CLI entry-point
+powered by `Typer <https://typer.tiangolo.com>`_.  List all available commands
+and global options with:
 
-.. code-block:: python
+.. code-block:: bash
 
-   from scikit import Analysis
+   scical --help
 
-A typical workflow:
+Each sub-command has its own ``--help`` flag that describes every option:
 
-.. code-block:: python
+.. code-block:: bash
 
-   import numpy as np
-   from scikit import Analysis
+   scical msd --help
+   scical rg --help
+   scical dssp --help
+   # … and so on
 
-   # Load or generate your data
-   data = np.loadtxt("my_data.csv", delimiter=",")
+Available sub-commands
+~~~~~~~~~~~~~~~~~~~~~~
 
-   # Run analysis (replace with actual function names)
-   result = Analysis.run(data)
-   print(result)
+.. list-table::
+   :widths: 25 75
+   :header-rows: 1
 
-For the full API, see :doc:`api/analysis`.
+   * - Command
+     - Description
+   * - ``msd``
+     - Per-segment Cα mean squared displacement (FFT, parallel)
+   * - ``rg``
+     - Per-segment radius of gyration time series
+   * - ``dssp``
+     - Per-residue DSSP helicity and β-sheet content
+   * - ``distance``
+     - Cα–Cα distances for user-defined residue pairs over a trajectory
+   * - ``distance-acf``
+     - Normalised fluctuation ACF of inter-Cα distances
+   * - ``vector-acf``
+     - End-to-end Cα vector autocorrelation function
+   * - ``contacts``
+     - Intra- and inter-chain heavy-atom contact maps (parallel)
+   * - ``aggr``
+     - Aggregation analysis: clustering, PBC recentering, radial density
+
+Usage examples
+~~~~~~~~~~~~~~
+
+**Mean squared displacement**
+
+.. code-block:: bash
+
+   scical msd --top conf.psf --traj system.xtc \
+       --resid 1:50 --outdir ./msd_results --nproc 8
+
+Output: ``./msd_results/<segid>_msd.dat`` — two columns: lag time (ps) and MSD (Å²).
+
+**Radius of gyration**
+
+.. code-block:: bash
+
+   scical rg --top conf.psf --traj system.xtc \
+       --out rg.dat --stride 5 --nproc 4
+
+Output: ``rg.dat`` — columns: frame index, Rg (Å) per segment.
+
+**DSSP secondary structure**
+
+.. code-block:: bash
+
+   scical dssp --top conf.psf --traj system.xtc \
+       --hout helicity.dat --bout beta.dat --stride 10 --nproc 4
+
+Output: ``helicity.dat`` and ``beta.dat`` — per-residue helix / β-sheet
+fractions (0–1) for each segment.
+
+**Cα–Cα pair distances**
+
+Prepare a pair file (comma- or space-separated, ``#`` comments allowed):
+
+.. code-block:: text
+
+   # resid1  segid1  resid2  segid2
+   10        PROA    45      PROA
+   10        PROA    45      PROB
+
+Then run:
+
+.. code-block:: bash
+
+   scical distance --top conf.psf --traj system.dcd \
+       -f pairs.dat --stride 2 --workers 8
+
+Output: ``pairs_distance.dat`` — one row per pair, one column per frame.
+
+**Distance autocorrelation function**
+
+.. code-block:: bash
+
+   scical distance-acf --top conf.psf --traj system.xtc \
+       --pairs pairs.dat --out distance_acf.dat --stride 10 --nproc 4
+
+Output: ``distance_acf.dat`` — columns: lag time (ps), normalised ACF per pair.
+
+**Vector autocorrelation function**
+
+.. code-block:: bash
+
+   scical vector-acf --top conf.psf --traj system.xtc \
+       --pairs pairs.dat --out vector_acf.dat --stride 10 --nproc 4
+
+Output: ``vector_acf.dat`` — columns: lag time (ps), normalised vector ACF per pair.
+
+**Contact maps**
+
+.. code-block:: bash
+
+   scical contacts --top system.psf --traj traj.dcd \
+       --cutoff 8.0 --stride 5 --nproc 8 --out contacts
+
+Output: four NumPy binary files — ``contacts_intra.npy``, ``contacts_inter.npy``,
+``contacts.npy`` (combined), and ``contacts_resids.npy``.
+
+**Aggregation analysis**
+
+.. code-block:: bash
+
+   # Basic: cluster statistics only
+   scical aggr --top conf.psf --traj system.xtc --rcut 8.0
+
+   # With PBC recentering and radial density profile
+   scical aggr --top conf.psf --traj system.xtc \
+       --rcut 8.0 --recenter --density --dr 2.0 \
+       --n-frames-avg 100 --outtraj recentered.xtc
+
+Output: ``aggr.dat`` (per-frame monomer / cluster counts),
+``recentered.xtc`` (recentered trajectory), and
+``density_profile.dat`` (radial concentration in mM vs. radius in Å).
+
+For the full API reference, see :doc:`api/analysis`.
 
 ----
 
 Plots Module
 ------------
 
-The :mod:`scikit.plots` module wraps Matplotlib to produce publication-ready
+The :mod:`SciKit.plots` module wraps Matplotlib to produce publication-ready
 figures with minimal boilerplate:
 
 .. code-block:: python
 
    import numpy as np
-   from scikit import plots
+   from SciKit import plots
 
    data = np.random.randn(200)
 
@@ -115,22 +226,15 @@ For the full API, see :doc:`api/plots`.
 Tools Module
 ------------
 
-The :mod:`scikit.tools` module provides high-level convenience functions that
+The :mod:`SciKit.tools` module provides high-level convenience functions that
 combine analysis and plotting into single calls:
 
 .. code-block:: python
 
-   from scikit import tools
+   from SciKit import tools
 
    # One-liner end-to-end pipeline (replace with actual function names)
    tools.run_pipeline("my_data.csv", output_dir="results/")
-
-SciKit also exposes a **command-line interface** powered by Typer. After
-installation you can run:
-
-.. code-block:: bash
-
-   scikit --help
 
 For the full API, see :doc:`api/tools`.
 
@@ -139,12 +243,12 @@ For the full API, see :doc:`api/tools`.
 Utils Module
 ------------
 
-The :mod:`scikit.utils` module contains shared helpers used across the package.
+The :mod:`SciKit.utils` module contains shared helpers used across the package.
 You can also call them directly:
 
 .. code-block:: python
 
-   from scikit import utils
+   from SciKit import utils
 
    # File I/O helper (replace with actual function names)
    data = utils.load("my_data.csv")
@@ -153,32 +257,6 @@ You can also call them directly:
    utils.validate(data)
 
 For the full API, see :doc:`api/utils`.
-
-----
-
-A Minimal End-to-End Example
------------------------------
-
-.. code-block:: python
-
-   import numpy as np
-   from scikit import Analysis, plots, tools, utils
-
-   # 1. Load data
-   data = utils.load("experiment.csv")
-
-   # 2. Validate
-   utils.validate(data)
-
-   # 3. Analyse
-   result = Analysis.run(data)
-
-   # 4. Visualise
-   fig, ax = plots.plot(result)
-   fig.savefig("figure.png", dpi=150)
-
-   # 5. Or run the full pipeline at once
-   tools.run_pipeline("experiment.csv", output_dir="results/")
 
 ----
 
