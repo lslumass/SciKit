@@ -11,10 +11,10 @@ SciKit documentation
    :maxdepth: 2
    :caption: Contents:
 
-   QuickStart
+   quickstart
    api/plots
    api/utils
    api/tools
    api/analysis
-   
+
 
