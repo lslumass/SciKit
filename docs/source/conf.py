@@ -29,7 +29,7 @@ extensions = [
     'myst_parser',
 ]
 
-autodoc_mock_imports = ["HyresBuilder"]
+autodoc_mock_imports = ["HyresBuilder", "openmm"]
 
 templates_path = ['_templates']
 exclude_patterns = []
