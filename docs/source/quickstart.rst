@@ -75,8 +75,7 @@ Each sub-command has its own ``--help`` flag that describes every option:
    scical dssp --help
    # … and so on
 
-Available sub-commands
-~~~~~~~~~~~~~~~~~~~~~~
+**Available sub-commands**
 
 .. list-table::
    :widths: 25 75
@@ -100,100 +99,6 @@ Available sub-commands
      - Intra- and inter-chain heavy-atom contact maps (parallel)
    * - ``aggr``
      - Aggregation analysis: clustering, PBC recentering, radial density
-
-Usage examples
-~~~~~~~~~~~~~~
-
-**Mean squared displacement**
-
-.. code-block:: bash
-
-   scical msd --top conf.psf --traj system.xtc \
-       --resid 1:50 --outdir ./msd_results --nproc 8
-
-Output: ``./msd_results/<segid>_msd.dat`` — two columns: lag time (ps) and MSD (Å²).
-
-**Radius of gyration**
-
-.. code-block:: bash
-
-   scical rg --top conf.psf --traj system.xtc \
-       --out rg.dat --stride 5 --nproc 4
-
-Output: ``rg.dat`` — columns: frame index, Rg (Å) per segment.
-
-**DSSP secondary structure**
-
-.. code-block:: bash
-
-   scical dssp --top conf.psf --traj system.xtc \
-       --hout helicity.dat --bout beta.dat --stride 10 --nproc 4
-
-Output: ``helicity.dat`` and ``beta.dat`` — per-residue helix / β-sheet
-fractions (0–1) for each segment.
-
-**Cα–Cα pair distances**
-
-Prepare a pair file (comma- or space-separated, ``#`` comments allowed):
-
-.. code-block:: text
-
-   # resid1  segid1  resid2  segid2
-   10        PROA    45      PROA
-   10        PROA    45      PROB
-
-Then run:
-
-.. code-block:: bash
-
-   scical distance --top conf.psf --traj system.dcd \
-       -f pairs.dat --stride 2 --workers 8
-
-Output: ``pairs_distance.dat`` — one row per pair, one column per frame.
-
-**Distance autocorrelation function**
-
-.. code-block:: bash
-
-   scical distance-acf --top conf.psf --traj system.xtc \
-       --pairs pairs.dat --out distance_acf.dat --stride 10 --nproc 4
-
-Output: ``distance_acf.dat`` — columns: lag time (ps), normalised ACF per pair.
-
-**Vector autocorrelation function**
-
-.. code-block:: bash
-
-   scical vector-acf --top conf.psf --traj system.xtc \
-       --pairs pairs.dat --out vector_acf.dat --stride 10 --nproc 4
-
-Output: ``vector_acf.dat`` — columns: lag time (ps), normalised vector ACF per pair.
-
-**Contact maps**
-
-.. code-block:: bash
-
-   scical contacts --top system.psf --traj traj.dcd \
-       --cutoff 8.0 --stride 5 --nproc 8 --out contacts
-
-Output: four NumPy binary files — ``contacts_intra.npy``, ``contacts_inter.npy``,
-``contacts.npy`` (combined), and ``contacts_resids.npy``.
-
-**Aggregation analysis**
-
-.. code-block:: bash
-
-   # Basic: cluster statistics only
-   scical aggr --top conf.psf --traj system.xtc --rcut 8.0
-
-   # With PBC recentering and radial density profile
-   scical aggr --top conf.psf --traj system.xtc \
-       --rcut 8.0 --recenter --density --dr 2.0 \
-       --n-frames-avg 100 --outtraj recentered.xtc
-
-Output: ``aggr.dat`` (per-frame monomer / cluster counts),
-``recentered.xtc`` (recentered trajectory), and
-``density_profile.dat`` (radial concentration in mM vs. radius in Å).
 
 For the full API reference, see :doc:`api/analysis`.
 
