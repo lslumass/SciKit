@@ -229,7 +229,8 @@ def cmd_msd(
         ``<outdir>/<segid>_msd.dat`` — two columns: lag time (ps) and MSD (Å²).
         ``<outdir>/<segid>_CA_msd.dat`` — per-Cα MSD table (``--per-residue`` only).
 
-    Example:
+    Example::
+
             scical msd --top conf.psf --traj system.xtc --resid 1:50 --outdir ./msd_results --nproc 8
     """
     import MDAnalysis as mda
@@ -355,7 +356,8 @@ def cmd_rg(
         ``<out>`` — space-separated columns: ``frame  <segid1>  <segid2>  …``
         Units: frame index (dimensionless), Rg in ångström.
 
-    Example:
+    Example::
+
             scical rg --top conf.psf --traj system.xtc --out rg.dat --stride 5 --nproc 4
     """
     import MDAnalysis as mda
@@ -533,7 +535,8 @@ def cmd_dssp(
         ``residue  <segid1>  <segid2>  …``
         Values are per-residue helix / β-strand occupancy fractions in [0, 1].
 
-    Example:
+    Example::
+
             scical dssp --top conf.psf --traj system.xtc --hout helicity.dat --bout beta.dat --stride 10 --nproc 4
     """
     import MDAnalysis as mda
@@ -866,7 +869,8 @@ def cmd_dist(
         ``<pair_file_stem>_distance.dat`` — one row per pair, one column per
         frame, prefixed by ``resid_1, segid_1, resid_2, segid_2``.
 
-    Example:
+    Example::
+
             scical distance --top conf.psf --traj system.dcd -f pairs.dat --stride 2 --workers 8
     """
     import MDAnalysis as mda
@@ -1103,7 +1107,8 @@ def cmd_dist_acf(
         ``<out>`` — columns: lag time (ps), normalised ACF per pair.
         The zero-lag value is normalised to 1.
 
-    Example:
+    Example::
+
             scical distance-acf --top conf.psf --traj system.xtc --pairs pairs.dat --out distance_acf.dat --stride 10 --nproc 4
     """
     pair_list = _read_pairs_file(pairs)
@@ -1266,7 +1271,8 @@ def cmd_vector_acf(
     Output:
         ``<out>`` — columns: lag time (ps), normalised vector ACF per pair.
 
-    Example:
+    Example::
+
             scical vector-acf --top conf.psf --traj system.xtc --pairs pairs.dat --out vector_acf.dat --stride 10 --nproc 4
     """
     pair_list = _read_pairs_file(pairs)
@@ -1419,7 +1425,8 @@ def cmd_contacts(
         Four NumPy binary files: ``<stem>_intra.npy``, ``<stem>_inter.npy``,
         ``<stem>.npy`` (combined), and ``<stem>_resids.npy``.
 
-    Example:
+    Example::
+
             scical contacts --top system.psf --traj traj.dcd --cutoff 8.0 --stride 5 --nproc 8 --out contacts
     """
     import MDAnalysis as mda
@@ -1799,7 +1806,8 @@ def cmd_aggr(
         - ``<profile>`` — radial density: radius (Å), mean (mM), std dev (mM)
           (``--density`` only).
 
-    Example:
+    Example::
+
             # Cluster statistics only
             scical aggr --top conf.psf --traj system.xtc --rcut 8.0
 
