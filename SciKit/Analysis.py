@@ -230,6 +230,7 @@ def cmd_msd(
         ``<outdir>/<segid>_CA_msd.dat`` — per-Cα MSD table (``--per-residue`` only).
 
     Example:
+
         .. code-block:: bash
 
             scical msd --top conf.psf --traj system.xtc \\
