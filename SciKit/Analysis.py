@@ -230,11 +230,7 @@ def cmd_msd(
         ``<outdir>/<segid>_CA_msd.dat`` — per-Cα MSD table (``--per-residue`` only).
 
     Example:
-
-        .. code-block:: bash
-
-            scical msd --top conf.psf --traj system.xtc \\
-                --resid 1:50 --outdir ./msd_results --nproc 8
+            scical msd --top conf.psf --traj system.xtc --resid 1:50 --outdir ./msd_results --nproc 8
     """
     import MDAnalysis as mda
 
@@ -360,10 +356,7 @@ def cmd_rg(
         Units: frame index (dimensionless), Rg in ångström.
 
     Example:
-        .. code-block:: bash
-
-            scical rg --top conf.psf --traj system.xtc \\
-                --out rg.dat --stride 5 --nproc 4
+            scical rg --top conf.psf --traj system.xtc --out rg.dat --stride 5 --nproc 4
     """
     import MDAnalysis as mda
 
@@ -541,10 +534,7 @@ def cmd_dssp(
         Values are per-residue helix / β-strand occupancy fractions in [0, 1].
 
     Example:
-        .. code-block:: bash
-
-            scical dssp --top conf.psf --traj system.xtc \\
-                --hout helicity.dat --bout beta.dat --stride 10 --nproc 4
+            scical dssp --top conf.psf --traj system.xtc --hout helicity.dat --bout beta.dat --stride 10 --nproc 4
     """
     import MDAnalysis as mda
 
@@ -853,7 +843,7 @@ def cmd_dist(
     Results are assembled and written to a ``_distance.dat`` file placed
     alongside each input pair file.
 
-    **Pair file format** (comma- or whitespace-separated, ``#`` comments allowed)::
+    **Pair file format** (comma- or whitespace-separated, ``#`` comments allowed):
 
         resid1  segid1  resid2  segid2
         10      PROA    45      PROA
@@ -877,10 +867,7 @@ def cmd_dist(
         frame, prefixed by ``resid_1, segid_1, resid_2, segid_2``.
 
     Example:
-        .. code-block:: bash
-
-            scical distance --top conf.psf --traj system.dcd \\
-                -f pairs.dat --stride 2 --workers 8
+            scical distance --top conf.psf --traj system.dcd -f pairs.dat --stride 2 --workers 8
     """
     import MDAnalysis as mda
 
@@ -1117,10 +1104,7 @@ def cmd_dist_acf(
         The zero-lag value is normalised to 1.
 
     Example:
-        .. code-block:: bash
-
-            scical distance-acf --top conf.psf --traj system.xtc \\
-                --pairs pairs.dat --out distance_acf.dat --stride 10 --nproc 4
+            scical distance-acf --top conf.psf --traj system.xtc --pairs pairs.dat --out distance_acf.dat --stride 10 --nproc 4
     """
     pair_list = _read_pairs_file(pairs)
     if not pair_list:
@@ -1283,10 +1267,7 @@ def cmd_vector_acf(
         ``<out>`` — columns: lag time (ps), normalised vector ACF per pair.
 
     Example:
-        .. code-block:: bash
-
-            scical vector-acf --top conf.psf --traj system.xtc \\
-                --pairs pairs.dat --out vector_acf.dat --stride 10 --nproc 4
+            scical vector-acf --top conf.psf --traj system.xtc --pairs pairs.dat --out vector_acf.dat --stride 10 --nproc 4
     """
     pair_list = _read_pairs_file(pairs)
     if not pair_list:
@@ -1439,10 +1420,7 @@ def cmd_contacts(
         ``<stem>.npy`` (combined), and ``<stem>_resids.npy``.
 
     Example:
-        .. code-block:: bash
-
-            scical contacts --top system.psf --traj traj.dcd \\
-                --cutoff 8.0 --stride 5 --nproc 8 --out contacts
+            scical contacts --top system.psf --traj traj.dcd --cutoff 8.0 --stride 5 --nproc 8 --out contacts
     """
     import MDAnalysis as mda
 
@@ -1822,15 +1800,11 @@ def cmd_aggr(
           (``--density`` only).
 
     Example:
-        .. code-block:: bash
-
             # Cluster statistics only
             scical aggr --top conf.psf --traj system.xtc --rcut 8.0
 
             # With PBC recentering and radial density profile
-            scical aggr --top conf.psf --traj system.xtc \\
-                --rcut 8.0 --recenter --density --dr 2.0 \\
-                --n-frames-avg 100 --outtraj recentered.xtc
+            scical aggr --top conf.psf --traj system.xtc --rcut 8.0 --recenter --density --dr 2.0 --n-frames-avg 100 --outtraj recentered.xtc
     """
     import MDAnalysis as mda
 
