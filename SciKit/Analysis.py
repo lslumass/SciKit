@@ -1311,13 +1311,75 @@ HEAVY_ATOMS = "name CA CB CC CD CE CF"
 """str: MDAnalysis selection string for common heavy side-chain atoms."""
 
 
+def _parse_components(spec, segids):
+    """Parse a component specification string into a mapping of label → segid list.
+
+    Segids are taken from *segids* in order and grouped according to the counts
+    in *spec*.  If *spec* is ``None``, all segids are placed in a single
+    component labelled ``"A"``.
+
+    Args:
+        spec (Optional[str]): Component spec, e.g. ``"A:100 B:100 C:100"``.
+        segids (list[str]): Ordered list of segids detected from the topology.
+
+    Returns:
+        dict[str, list[str]]: Mapping ``{label: [segid, ...]}``.
+
+    Raises:
+        ValueError: If the total count in *spec* does not match ``len(segids)``.
+    """
+    if spec is None:
+        return {"A": segids}
+    comp_map = {}
+    idx = 0
+    for token in spec.split():
+        label, count = token.split(":")
+        count = int(count)
+        comp_map[label] = segids[idx: idx + count]
+        idx += count
+    if idx != len(segids):
+        raise ValueError(
+            f"Component spec accounts for {idx} segids but {len(segids)} found."
+        )
+    return comp_map
+
+
+def _parse_pairs(spec, comp_labels):
+    """Parse a pair specification string into a list of ``(labelX, labelY)`` tuples.
+
+    Args:
+        spec (str): Space-separated pair tokens, e.g. ``"A-A A-B"``.
+        comp_labels (list[str]): Known component labels.
+
+    Returns:
+        list[tuple[str, str]]: Ordered list of requested component pairs.
+
+    Raises:
+        ValueError: If a token references an unknown component label.
+    """
+    pairs = []
+    for token in spec.split():
+        x, y = token.split("-")
+        if x not in comp_labels or y not in comp_labels:
+            raise ValueError(f"Unknown component in pair '{token}'. Known: {comp_labels}")
+        pairs.append((x, y))
+    return pairs
+
+
 def _contacts_worker(args):
-    """Subprocess worker: accumulate intra- and inter-chain contact counts over assigned frames.
+    """Subprocess worker: accumulate contact matrices for all requested pairs over a frame chunk.
 
     Uses ``MDAnalysis.lib.distances.capped_distance`` for efficient
-    neighbour-list construction.  Contacts are classified as *intra-chain*
-    (same segment, sequence separation ≥ 4 residues) or *inter-chain*
-    (different segments).  Each unique contact is counted once per frame.
+    neighbour-list construction.  Supports multi-component systems with
+    arbitrary same- and cross-component contact pair requests.
+
+    For same-component pairs the worker accumulates:
+
+    - **intra** — contacts within the same chain copy (sequence separation ≥ 4).
+    - **inter** — contacts between different chain copies of the same component.
+
+    For cross-component pairs only **inter** (cross-component) contacts are
+    accumulated.
 
     Args:
         args (tuple): A packed argument tuple containing:
@@ -1329,59 +1391,97 @@ def _contacts_worker(args):
             - **frame_indices** (*list[int]*) — Absolute frame indices to
               process in this worker.
             - **atom_to_local** (*np.ndarray[int32]*) — Maps each heavy-atom
-              index to its local residue index within its chain copy.
+              row to its local residue index within its chain copy.
             - **atom_to_copy** (*np.ndarray[int32]*) — Maps each heavy-atom
-              index to its chain-copy index.
-            - **N** (*int*) — Number of residues per chain copy.
+              row to its copy index within its component.
+            - **atom_to_comp** (*np.ndarray[int32]*) — Maps each heavy-atom
+              row to its component index.
+            - **pair_specs** (*list[tuple]*) — List of
+              ``(comp_idx_X, comp_idx_Y, N_X, N_Y, n_copies_X, same_comp)``
+              tuples, one per requested pair.
 
     Returns:
-        tuple[np.ndarray, np.ndarray]: ``(intra_sum, inter_sum)`` — two
-        ``(N, N)`` float64 arrays accumulating the raw contact counts for
-        the assigned frames.
+        dict[tuple[int,int], dict[str, Optional[np.ndarray]]]:
+        ``{(cx, cy): {"inter": np.ndarray, "intra": np.ndarray or None}}``
+        with partial contact counts accumulated over the assigned frames.
     """
     import MDAnalysis as mda
     from MDAnalysis.lib.distances import capped_distance
 
-    top, traj, cutoff, frame_indices, atom_to_local, atom_to_copy, N = args
+    (top, traj, cutoff, frame_indices,
+     atom_to_local, atom_to_copy, atom_to_comp,
+     pair_specs) = args
 
     u       = mda.Universe(top, traj) if traj else mda.Universe(top)
     all_hvy = u.select_atoms(HEAVY_ATOMS)
-    partial_intra = np.zeros((N, N), dtype=np.float64)
-    partial_inter = np.zeros((N, N), dtype=np.float64)
+
+    partials = {}
+    for spec in pair_specs:
+        cx, cy, N_X, N_Y, _, same = spec
+        key = (cx, cy)
+        partials[key] = {
+            "inter": np.zeros((N_X, N_Y), dtype=np.float64),
+            "intra": np.zeros((N_X, N_X), dtype=np.float64) if same else None,
+        }
 
     for frame in frame_indices:
         u.trajectory[frame]
         pos_all = all_hvy.positions
         box     = u.dimensions
 
-        pairs_raw, _ = capped_distance(pos_all, pos_all, cutoff,
-                                       box=box, return_distances=True)
-        if len(pairs_raw) == 0:
+        pairs, _ = capped_distance(pos_all, pos_all, cutoff,
+                                   box=box, return_distances=True)
+        if len(pairs) == 0:
             continue
 
-        ri = pairs_raw[:, 0].astype(np.int32)
-        rj = pairs_raw[:, 1].astype(np.int32)
-        li = atom_to_local[ri]
-        lj = atom_to_local[rj]
-        ci = atom_to_copy[ri]
-        cj = atom_to_copy[rj]
+        ri   = pairs[:, 0].astype(np.int32)
+        rj   = pairs[:, 1].astype(np.int32)
+        li   = atom_to_local[ri]
+        lj   = atom_to_local[rj]
+        ci   = atom_to_copy[ri]
+        cj   = atom_to_copy[rj]
+        cmpi = atom_to_comp[ri]
+        cmpj = atom_to_comp[rj]
 
-        intra_mask = (ci == cj) & (np.abs(li - lj) >= 4)
-        if intra_mask.any():
-            key  = np.unique(np.stack([ci[intra_mask], li[intra_mask], lj[intra_mask]], axis=1), axis=0)
-            flat = key[:, 1] * N + key[:, 2]
-            m    = np.bincount(flat, minlength=N * N).reshape(N, N).astype(np.float64)
-            partial_intra += m + m.T
+        for spec in pair_specs:
+            cx, cy, N_X, N_Y, _, same = spec
+            key = (cx, cy)
 
-        inter_mask = ci != cj
-        if inter_mask.any():
-            key2  = np.unique(np.stack([ci[inter_mask], cj[inter_mask],
-                                        li[inter_mask], lj[inter_mask]], axis=1), axis=0)
-            flat2 = key2[:, 2] * N + key2[:, 3]
-            m2    = np.bincount(flat2, minlength=N * N).reshape(N, N).astype(np.float64)
-            partial_inter += m2 + m2.T
+            if same:
+                # ── Intra (same copy, same component) ────────────────────
+                intra_mask = (cmpi == cx) & (cmpj == cx) & (ci == cj) & (np.abs(li - lj) >= 4)
+                if intra_mask.any():
+                    k    = np.unique(np.stack([ci[intra_mask], li[intra_mask], lj[intra_mask]], axis=1), axis=0)
+                    flat = k[:, 1] * N_X + k[:, 2]
+                    m    = np.bincount(flat, minlength=N_X * N_X).reshape(N_X, N_X).astype(np.float64)
+                    partials[key]["intra"] += m + m.T
 
-    return partial_intra, partial_inter
+                # ── Inter (different copies, same component) ──────────────
+                inter_mask = (cmpi == cx) & (cmpj == cx) & (ci != cj)
+                if inter_mask.any():
+                    k2    = np.unique(np.stack([ci[inter_mask], cj[inter_mask],
+                                                li[inter_mask], lj[inter_mask]], axis=1), axis=0)
+                    flat2 = k2[:, 2] * N_X + k2[:, 3]
+                    m2    = np.bincount(flat2, minlength=N_X * N_Y).reshape(N_X, N_Y).astype(np.float64)
+                    partials[key]["inter"] += m2 + m2.T
+
+            else:
+                # ── Cross-component contacts (cx → cy and cy → cx) ───────
+                mask_xy = (cmpi == cx) & (cmpj == cy)
+                mask_yx = (cmpi == cy) & (cmpj == cx)
+
+                li_cx = np.concatenate([li[mask_xy], lj[mask_yx]])
+                lj_cy = np.concatenate([lj[mask_xy], li[mask_yx]])
+                ci_cx = np.concatenate([ci[mask_xy], cj[mask_yx]])
+                cj_cy = np.concatenate([cj[mask_xy], ci[mask_yx]])
+
+                if len(li_cx) > 0:
+                    k3    = np.unique(np.stack([ci_cx, cj_cy, li_cx, lj_cy], axis=1), axis=0)
+                    flat3 = k3[:, 2] * N_Y + k3[:, 3]
+                    m3    = np.bincount(flat3, minlength=N_X * N_Y).reshape(N_X, N_Y).astype(np.float64)
+                    partials[key]["inter"] += m3
+
+    return partials
 
 
 @app.command("contacts")
@@ -1389,45 +1489,71 @@ def cmd_contacts(
     top: Annotated[str, typer.Option("--top", help="Topology file")] = "system.psf",
     traj: Annotated[Optional[str], typer.Option("--traj", help="Trajectory (omit for single frame)")] = None,
     cutoff: Annotated[float, typer.Option("--cutoff", help="Distance cutoff in Å")] = 6.0,
+    components: Annotated[Optional[str], typer.Option("--components",
+        help="Component definitions e.g. 'A:100 B:100 C:100'. "
+             "Default: all segids treated as one component 'A'.")] = None,
+    pairs: Annotated[Optional[str], typer.Option("--pairs",
+        help="Contact pairs to compute e.g. 'A-A A-B B-B'. "
+             "Default: all same-component pairs.")] = None,
     start: Annotated[int, typer.Option("--start")] = 0,
     stop: Annotated[Optional[int], typer.Option("--stop")] = None,
     stride: Annotated[int, typer.Option("--stride")] = 1,
     nproc: Annotated[int, typer.Option("--nproc")] = 1,
-    out: Annotated[str, typer.Option("--out", help="Output stem (appended with _intra/_inter)")] = "contact_map.npy",
+    out: Annotated[str, typer.Option("--out", help="Output stem")] = "contact_map.npy",
 ):
-    """Calculate intra- and inter-chain **contact maps** (heavy-atom, parallel).
+    """Calculate intra- and inter-chain **contact maps** for multi-component systems (heavy-atom, parallel).
 
     Identifies contacts between heavy atoms (CA, CB, CC, CD, CE, CF) within
     a user-defined distance cutoff, accounting for periodic boundary conditions.
+    Supports systems containing multiple distinct peptide/protein components
+    (e.g. 100 copies of chain A + 100 copies of chain B).
+
+    Components are defined by grouping auto-detected segids::
+
+        --components "A:100 B:100 C:100"   # first 100 segids → A, next 100 → B, …
+
+    Contact pairs to compute::
+
+        --pairs "A-A A-B B-B"   # default: all same-component pairs
+
     Contacts are classified as:
 
-    - **Intra-chain** — same segment, sequence separation ≥ 4 residues.
-    - **Inter-chain** — atoms from different segment copies.
+    - **Intra** — same chain copy, sequence separation ≥ 4 residues (same-component pairs only).
+    - **Inter** — different chain copies of the same component, or cross-component contacts.
 
-    All chain copies must have the same number of residues.  Contact frequency
-    (contacts per frame per copy) is written as NumPy ``.npy`` files.
+    Normalisation: sum over all copy pairs / (n_copies_X × n_frames), giving the
+    average contacts that residue *i* of one copy makes with residue *j* per frame.
 
     Args:
-        top (str): Path to the topology file.
+        top (str): Path to the topology file (PSF).
         traj (Optional[str]): Path to the trajectory file.  When omitted,
             only the single frame in *top* is analysed.
         cutoff (float): Heavy-atom distance cutoff in ångström.
+        components (Optional[str]): Component definitions e.g. ``"A:100 B:100"``.
+            When omitted all segids are assigned to a single component ``"A"``.
+        pairs (Optional[str]): Contact pairs to compute e.g. ``"A-A A-B"``.
+            When omitted, all same-component pairs are computed.
         start (int): Index of the first trajectory frame.
         stop (Optional[int]): Index of the last trajectory frame (exclusive);
             ``None`` means use all frames.
         stride (int): Step between analysed frames.
         nproc (int): Number of parallel worker processes.
-        out (str): Output file stem — four files are written:
-            ``<stem>_intra.npy``, ``<stem>_inter.npy``, ``<stem>.npy``
-            (combined), and ``<stem>_resids.npy``.
+        out (str): Output file stem.  Per requested pair ``X-Y`` the following
+            files are written:
 
-    Output:
-        Four NumPy binary files: ``<stem>_intra.npy``, ``<stem>_inter.npy``,
-        ``<stem>.npy`` (combined), and ``<stem>_resids.npy``.
+            - ``<stem>_X-Y_intra.npy`` — intra-copy map (same-component only).
+            - ``<stem>_X-Y_inter.npy`` — inter-copy map (same-component only).
+            - ``<stem>_X-Y_total.npy`` — combined (or cross-component) map.
+            - ``<stem>_X-Y_resids.npy`` / ``<stem>_X-Y_resids_X.npy`` / ``_resids_Y.npy``.
 
     Example::
 
-            scical contacts --top system.psf --traj traj.dcd --cutoff 8.0 --stride 5 --nproc 8 --out contacts
+            # Single-component system (original behaviour)
+            scical contacts --top system.psf --traj traj.dcd --cutoff 8.0 --stride 5 --nproc 8
+
+            # Multi-component: 100 A-chains + 100 B-chains, compute A-A and A-B maps
+            scical contacts --top system.psf --traj traj.dcd \\
+                --components "A:100 B:100" --pairs "A-A A-B" --nproc 8
     """
     import MDAnalysis as mda
 
@@ -1436,47 +1562,68 @@ def cmd_contacts(
     u      = mda.Universe(top, traj) if traj else mda.Universe(top)
     all_ca = u.select_atoms("name CA")
     segids = list(dict.fromkeys(all_ca.segids))
-    n_copies = len(segids)
-    n_traj   = len(u.trajectory)
+    n_traj = len(u.trajectory)
 
-    seg_ca_list = [u.select_atoms(f"segid {s} and name CA") for s in segids]
-    N_list      = [len(ca) for ca in seg_ca_list]
-    if len(set(N_list)) != 1:
-        typer.echo(f"[!] Unequal residue counts across copies: {set(N_list)}", err=True)
-        raise typer.Exit(1)
-    N = N_list[0]
+    # ── Component setup ────────────────────────────────────────────────────
+    comp_map    = _parse_components(components, segids)
+    comp_labels = list(comp_map.keys())
 
+    req_pairs = _parse_pairs(pairs, comp_labels) if pairs else [(x, x) for x in comp_labels]
+
+    comp_ca = {label: [u.select_atoms(f"segid {s} and name CA") for s in segs]
+               for label, segs in comp_map.items()}
+    comp_N  = {}
+    for label, ca_list in comp_ca.items():
+        Ns = [len(ca) for ca in ca_list]
+        if len(set(Ns)) != 1:
+            typer.echo(f"[!] Component {label} has unequal residue counts: {set(Ns)}", err=True)
+            raise typer.Exit(1)
+        comp_N[label] = Ns[0]
+
+    comp_idx = {label: i for i, label in enumerate(comp_labels)}
+
+    # ── Lookup arrays: heavy atom row → (local_res, copy_within_comp, comp_idx) ──
     all_hvy     = u.select_atoms(HEAVY_ATOMS)
     M           = len(all_hvy)
     all_hvy_idx = all_hvy.indices
 
     atom_to_local = np.empty(M, dtype=np.int32)
     atom_to_copy  = np.empty(M, dtype=np.int32)
+    atom_to_comp  = np.empty(M, dtype=np.int32)
 
-    for c, ca in enumerate(seg_ca_list):
-        for res_local, res in enumerate(ca.residues):
-            res_hvy_idx = np.intersect1d(res.atoms.indices, all_hvy_idx)
-            rows = np.searchsorted(all_hvy_idx, res_hvy_idx)
-            atom_to_local[rows] = res_local
-            atom_to_copy[rows]  = c
+    for label, ca_list in comp_ca.items():
+        cidx = comp_idx[label]
+        for copy_within, ca in enumerate(ca_list):
+            for res_local, res in enumerate(ca.residues):
+                res_hvy_idx = np.intersect1d(res.atoms.indices, all_hvy_idx)
+                rows = np.searchsorted(all_hvy_idx, res_hvy_idx)
+                atom_to_local[rows] = res_local
+                atom_to_copy[rows]  = copy_within
+                atom_to_comp[rows]  = cidx
 
-    resids = seg_ca_list[0].residues.resids
+    comp_resids  = {label: comp_ca[label][0].residues.resids for label in comp_labels}
+    comp_ncopies = {label: len(segs) for label, segs in comp_map.items()}
+
+    pair_specs = [
+        (comp_idx[x], comp_idx[y], comp_N[x], comp_N[y], comp_ncopies[x], x == y)
+        for x, y in req_pairs
+    ]
+
     del u
 
     frames   = list(range(start, stop or n_traj, stride))
     n_frames = len(frames)
     nprocs   = min(nproc, n_frames)
 
-    typer.echo(f"Copies        : {n_copies}  ({segids[0]} … {segids[-1]})")
-    typer.echo(f"Residues/copy : {N}")
-    typer.echo(f"Heavy atoms   : {M}")
-    typer.echo(f"Cutoff        : {cutoff} Å")
-    typer.echo(f"Frames        : {n_frames}  (stride={stride})")
-    typer.echo(f"Workers       : {nprocs}")
+    typer.echo(f"Components : {', '.join(f'{l}×{comp_ncopies[l]}(N={comp_N[l]})' for l in comp_labels)}")
+    typer.echo(f"Pairs      : {', '.join(f'{x}-{y}' for x, y in req_pairs)}")
+    typer.echo(f"Cutoff     : {cutoff} Å  ({cutoff / 10:.2f} nm)")
+    typer.echo(f"Frames     : {n_frames}  (stride={stride})")
+    typer.echo(f"Workers    : {nprocs}")
 
     chunks      = [frames[i::nprocs] for i in range(nprocs)]
     worker_args = [
-        (top, traj, cutoff, chunk, atom_to_local, atom_to_copy, N)
+        (top, traj, cutoff, chunk, atom_to_local, atom_to_copy, atom_to_comp, pair_specs)
         for chunk in chunks
     ]
 
@@ -1488,23 +1635,37 @@ def cmd_contacts(
         with ctx.Pool(processes=nprocs) as pool:
             results = pool.map(_contacts_worker, worker_args)
 
-    intra_sum, inter_sum = zip(*results)
-    denom     = n_copies * n_frames
-    intra_map = np.sum(intra_sum, axis=0) / denom
-    inter_map = np.sum(inter_sum, axis=0) / denom
-
+    # ── Merge and save ─────────────────────────────────────────────────────
     stem = out.removesuffix(".npy")
-    np.save(f"{stem}_intra.npy",  intra_map)
-    np.save(f"{stem}_inter.npy",  inter_map)
-    np.save(f"{stem}.npy",        intra_map + inter_map)
-    np.save(f"{stem}_resids.npy", resids)
+
+    for (x, y), spec in zip(req_pairs, pair_specs):
+        cx, cy, N_X, N_Y, n_X, same = spec
+        key   = (cx, cy)
+        denom = n_X * n_frames
+
+        inter_sum = sum(r[key]["inter"] for r in results)
+        inter_map = inter_sum / denom
+
+        tag = f"{x}-{y}"
+        if same:
+            intra_sum = sum(r[key]["intra"] for r in results)
+            intra_map = intra_sum / denom
+            np.save(f"{stem}_{tag}_intra.npy",  intra_map)
+            np.save(f"{stem}_{tag}_inter.npy",  inter_map)
+            np.save(f"{stem}_{tag}_total.npy",  intra_map + inter_map)
+            np.save(f"{stem}_{tag}_resids.npy", comp_resids[x])
+            typer.echo(f"Saved -> {stem}_{tag}_intra.npy  (max {intra_map.max():.4f})")
+            typer.echo(f"Saved -> {stem}_{tag}_inter.npy  (max {inter_map.max():.4f})")
+            typer.echo(f"Saved -> {stem}_{tag}_total.npy  (max {(intra_map + inter_map).max():.4f})")
+            typer.echo(f"Saved -> {stem}_{tag}_resids.npy")
+        else:
+            np.save(f"{stem}_{tag}_total.npy",      inter_map)
+            np.save(f"{stem}_{tag}_resids_{x}.npy", comp_resids[x])
+            np.save(f"{stem}_{tag}_resids_{y}.npy", comp_resids[y])
+            typer.echo(f"Saved -> {stem}_{tag}_total.npy  (max {inter_map.max():.4f})")
 
     elapsed = time.perf_counter() - t0
     typer.echo(f"\nDone in {elapsed:.2f}s")
-    typer.echo(f"Saved -> {stem}_intra.npy   (max {intra_map.max():.4f})")
-    typer.echo(f"Saved -> {stem}_inter.npy   (max {inter_map.max():.4f})")
-    typer.echo(f"Saved -> {stem}.npy         (max {(intra_map+inter_map).max():.4f})")
-    typer.echo(f"Saved -> {stem}_resids.npy  (resids {resids[0]}–{resids[-1]})")
 
 
 # =============================================================================
