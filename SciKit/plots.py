@@ -515,3 +515,129 @@ def plot_contacts(ax, contacts, cmap, x_shift, y_shift, **kwargs):
     Ny = contacts.shape[1]
     im = ax.imshow(contacts, origin='lower', extent=[x_shift, Nx+x_shift, y_shift, Ny+y_shift], cmap=cmap, **kwargs)
     return im
+
+
+class DualYAxis:
+    """
+    A wrapper around a matplotlib Axes that supports independent y-axis coloring
+    for dual-axis (twinx) figures.
+
+    Do not instantiate directly. Use :func:`dualY` to create a pair.
+
+    All standard ``Axes`` methods (``plot``, ``set_ylabel``, ``set_xlim``, etc.)
+    are transparently forwarded to the underlying axes via ``__getattr__``.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        The underlying axes to wrap.
+    side : {'left', 'right'}
+        Which y-axis spine this object owns. ``'left'`` for the original axes,
+        ``'right'`` for the twinx axes.
+
+    Examples
+    --------
+    >>> fig, axs = general_temp(1, 1, 8, 5)
+    >>> ax1, ax2 = dualY(axs)
+    >>> ax1.plot(x, y1, color=color_cycle(1))
+    >>> ax2.plot(x, y2, color=color_cycle(2))
+    >>> ax1.set_ylabel('Temperature (°C)')
+    >>> ax2.set_ylabel('Pressure (Pa)')
+    >>> ax1.set_color(color_cycle(1))
+    >>> ax2.set_color(color_cycle(2))
+    """
+
+    def __init__(self, ax, side):
+        object.__setattr__(self, '_ax', ax)
+        object.__setattr__(self, '_side', side)
+
+    def set_color(self, color):
+        """
+        Apply a uniform color to this axis's y-spine, ticks, tick labels, and label.
+
+        Parameters
+        ----------
+        color : color-like
+            Any matplotlib-compatible color string or tuple
+            (e.g. ``'#1f77b4'``, ``'red'``, ``(0.1, 0.5, 0.9)``).
+
+        Examples
+        --------
+        >>> ax1.set_color('#1f77b4')
+        >>> ax2.set_color('#ff7f0e')
+        """
+        ax   = object.__getattribute__(self, '_ax')
+        side = object.__getattribute__(self, '_side')
+
+        ax.spines[side].set_edgecolor(color)
+        ax.tick_params(axis='y', colors=color)
+        ax.yaxis.label.set_color(color)
+
+    def __getattr__(self, name):
+        ax = object.__getattribute__(self, '_ax')
+        return getattr(ax, name)
+
+    def __setattr__(self, name, value):
+        ax = object.__getattribute__(self, '_ax')
+        setattr(ax, name, value)
+
+
+def dualY(ax):
+    """
+    Set up a dual y-axis on an existing axes and return two :class:`DualYAxis`
+    wrappers — one for each y-axis — whose :meth:`~DualYAxis.set_color` method
+    colors the spine, ticks, tick labels, and axis label together.
+
+    The left spine belongs to ``ax1``; the right spine belongs to ``ax2``.
+    Redundant inner spines are hidden so the frame stays clean.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        A single axes object, typically one element from the array returned by
+        :func:`general_temp`.
+
+    Returns
+    -------
+    ax1 : DualYAxis
+        Wraps the original ``ax``. Owns the **left** y-axis.
+    ax2 : DualYAxis
+        Wraps a new ``ax.twinx()``. Owns the **right** y-axis.
+
+    Notes
+    -----
+    - ``ax1`` and ``ax2`` proxy all standard ``Axes`` calls, so you can use
+      ``ax1.plot(...)``, ``ax1.set_xlim(...)``, ``ax2.set_ylabel(...)``, etc.
+      as normal.
+    - Call :meth:`~DualYAxis.set_color` *after* setting ``ylabel`` so the
+      label color is applied correctly.
+    - The x-axis ticks and spine color are not modified; style them via
+      ``ax1.tick_params(axis='x', ...)`` as usual.
+
+    Examples
+    --------
+    >>> fig, axs = general_temp(1, 1, 8, 5)
+    >>> ax1, ax2 = dualY(axs)
+    >>>
+    >>> ax1.plot(x, temp,     color=color_cycle(1), label='Temperature')
+    >>> ax2.plot(x, pressure, color=color_cycle(2), label='Pressure')
+    >>>
+    >>> ax1.set_xlabel('Time (s)')
+    >>> ax1.set_ylabel('Temperature (°C)')
+    >>> ax2.set_ylabel('Pressure (Pa)')
+    >>>
+    >>> ax1.set_color(color_cycle(1))
+    >>> ax2.set_color(color_cycle(2))
+    """
+    twin = ax.twinx()
+
+    ax.spines['right'].set_visible(False)
+    twin.spines['left'].set_visible(False)
+
+    twin.tick_params(axis='both', which='major', direction='in', width=2, length=8.0)
+    twin.tick_params(axis='both', which='minor', direction='in', width=1.5, length=4.0)
+    plt.setp(twin.spines.values(), linewidth=2)
+
+    ax1 = DualYAxis(ax,   side='left')
+    ax2 = DualYAxis(twin, side='right')
+    return ax1, ax2
