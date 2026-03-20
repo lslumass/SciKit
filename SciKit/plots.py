@@ -517,6 +517,136 @@ def plot_contacts(ax, contacts, cmap, x_shift, y_shift, **kwargs):
     return im
 
 
+import numpy as np
+import matplotlib as mpl
+from matplotlib.colors import LogNorm, LinearSegmentedColormap
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+
+def plot_hist2d_contour(ax, x, y, bins=50, log_scale=False, contours=False, **kwargs):
+    """
+    Create a 2D histogram with optional contours.
+
+    Parameters:
+    -----------
+    x : array-like, shape (n_samples, n_features) or (n_samples,)
+        X data
+    y : array-like, shape (n_samples, n_features) or (n_samples,)
+        Y data
+    ax : matplotlib.axes.Axes
+        Axes object to plot on.
+    bins : int or array-like, default=50
+        Number of bins for histogram
+    log_scale : bool, default=False
+        Whether to use log scale for colors
+    contours : bool, default=False
+        Whether to overlay contour lines
+    **kwargs : dict
+        Additional customization options:
+          colorbar           : bool,                    default=False
+          cbar_size          : str,                     default='3%'
+          cbar_pad           : float,                   default=0.1
+          cmap               : str or LinearSegmentedColormap, default='viridis'
+          alpha              : float,                   default=1.0
+          n_contours         : int,                     default=5
+          contour_colors     : str,                     default='black'
+          contour_alpha      : float,                   default=0.6
+          contour_linewidths : float,                   default=1.0
+          contour_labels     : bool,                    default=False
+          override_contour_levels : array-like,         optional
+          grid               : bool,                    default=True
+
+    Returns:
+    --------
+    hist : 2D histogram array
+    xedges, yedges : bin edges
+    cbar_ax : colorbar axes object (None if colorbar=False)
+    """
+
+    from matplotlib.colors import LogNorm, LinearSegmentedColormap
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+    # Flatten arrays if they are 2D
+    x_flat = x.flatten() if x.ndim > 1 else x.copy()
+    y_flat = y.flatten() if y.ndim > 1 else y.copy()
+
+    # Remove any NaN values
+    mask = ~(np.isnan(x_flat) | np.isnan(y_flat))
+    x_clean = x_flat[mask]
+    y_clean = y_flat[mask]
+
+    # Create 2D histogram
+    hist, xedges, yedges = np.histogram2d(x_clean, y_clean, bins=[bins, bins], density=True)
+
+    # Handle log scale
+    hist_plot = hist.copy()
+    hist_plot[hist_plot == 0] = np.nan  # White for empty bins
+
+    norm = None
+    if log_scale:
+        min_val = np.nanmin(hist_plot[hist_plot > 0]) if np.any(hist_plot > 0) else 1
+        max_val = np.nanmax(hist_plot)
+        if max_val > min_val:
+            norm = LogNorm(vmin=min_val, vmax=max_val)
+        else:
+            log_scale = False
+
+    # Set colormap with white for NaN/empty bins
+    cmap = kwargs.get('cmap', 'viridis')
+    if isinstance(cmap, str):
+        cmap = mpl.colormaps[cmap].copy()
+    cmap.set_bad('white')
+
+    # Plot the 2D histogram
+    X, Y = np.meshgrid(xedges, yedges)
+    im = ax.pcolormesh(X, Y, hist_plot.T,
+                       cmap=cmap,
+                       norm=norm,
+                       shading='flat',
+                       alpha=kwargs.get('alpha', 1.0))
+
+    # Add contours if requested
+    if contours and np.any(hist > 0):
+        n_contours = kwargs.get('n_contours', 5)
+
+        if kwargs.get('override_contour_levels') is not None:
+            contour_levels = kwargs['override_contour_levels']
+        elif log_scale and norm is not None:
+            contour_levels = np.logspace(np.log10(min_val), np.log10(max_val), n_contours)
+        else:
+            contour_levels = np.linspace(np.nanmin(hist_plot), np.nanmax(hist_plot), n_contours)
+
+        x_centers = (xedges[:-1] + xedges[1:]) / 2
+        y_centers = (yedges[:-1] + yedges[1:]) / 2
+        X_contour, Y_contour = np.meshgrid(x_centers, y_centers)
+
+        cs = ax.contour(X_contour, Y_contour, hist_plot.T,
+                        levels=contour_levels,
+                        colors=kwargs.get('contour_colors', 'black'),
+                        alpha=kwargs.get('contour_alpha', 0.6),
+                        linewidths=kwargs.get('contour_linewidths', 1.0))
+
+        if kwargs.get('contour_labels', False):
+            ax.clabel(cs, inline=True, fontsize=8, fmt='%.1f')
+
+    # Grid
+    if kwargs.get('grid', True):
+        ax.grid(True, alpha=0.3)
+
+    # Optional colorbar
+    cbar_ax = None
+    if kwargs.get('colorbar', False):
+        try:
+            divider = make_axes_locatable(ax)
+            cbar_ax = divider.append_axes("right",
+                                          size=kwargs.get('cbar_size', '3%'),
+                                          pad=kwargs.get('cbar_pad', 0.1))
+            ax.get_figure().colorbar(im, cax=cbar_ax)
+        except Exception:
+            pass
+
+    return hist, xedges, yedges, cbar_ax
+
 class DualYAxis:
     """
     A wrapper around a matplotlib Axes that supports independent y-axis coloring
