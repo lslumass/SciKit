@@ -595,7 +595,7 @@ def plot_hist2d_contour(ax, x, y, bins=50, log_scale=False, contours=False, **kw
     cmap = kwargs.get('cmap', 'viridis')
     if isinstance(cmap, str):
         cmap = mpl.colormaps[cmap].copy()
-    cmap.set_bad('white')
+    cmap.set_bad(kwargs.get('bad_color', 'none'))
 
     # Plot the 2D histogram
     X, Y = np.meshgrid(xedges, yedges)
