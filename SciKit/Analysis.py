@@ -133,6 +133,8 @@ def _msd_worker(args: tuple):
             - **stride** (*int*) — Step between analysed frames.
             - **outdir** (*str*) — Directory where output files are written.
             - **per_residue** (*bool*) — Whether to write per-Cα MSD files.
+            - **max_tau** (*Optional[float]*) — Maximum lag time in ps;
+              ``None`` keeps all lag times.
 
     Returns:
         str: The *segid* that was processed, for logging in the parent process.
@@ -150,7 +152,7 @@ def _msd_worker(args: tuple):
     import MDAnalysis.analysis.msd as msd_mod
 
     segid, topology, trajectory, resid_range, \
-        start, stop, stride, outdir, per_residue = args
+        start, stop, stride, outdir, per_residue, max_tau = args
 
     u = mda.Universe(topology, trajectory)
 
@@ -161,8 +163,29 @@ def _msd_worker(args: tuple):
     if len(ag) == 0:
         raise ValueError(f"No atoms matched: '{selection}'")
 
+    # ── Determine effective stop frame ────────────────────────────────────
+    # _traj_stop converts -1 → None (MDAnalysis convention for "end of traj").
+    # We must guard against comparing int with None.
+    traj_stop = _traj_stop(stop)
+
+    if max_tau is not None:
+        # Effective timestep between analysed frames (ps).
+        dt = u.trajectory.dt * stride
+        # Number of frames needed so that max achievable lag = (n-1)*dt ≤ max_tau.
+        # +1e-9 guards against floating-point undercount when max_tau is an exact
+        # multiple of dt (e.g. max_tau/dt = 4.9999999 instead of 5.0).
+        n_frames_needed = int(max_tau / dt + 1e-9) + 1
+        effective_stop = start + n_frames_needed
+        # Clamp to the user-requested stop; None means "end", so skip the clamp.
+        if traj_stop is not None:
+            effective_stop = min(effective_stop, traj_stop)
+        # If effective_stop overshoots the trajectory length MDAnalysis
+        # silently clamps it, so no further guard is needed.
+    else:
+        effective_stop = traj_stop
+
     MSD = msd_mod.EinsteinMSD(u, select=selection, msd_type="xyz", fft=True)
-    MSD.run(start=start, stop=_traj_stop(stop), step=stride)
+    MSD.run(start=start, stop=effective_stop, step=stride)
 
     lagtimes = MSD.results.delta_t_values
     msds     = MSD.results.timeseries
@@ -204,6 +227,9 @@ def cmd_msd(
     stride: Annotated[int, typer.Option("--stride", help="Frame stride")] = 1,
     per_residue: Annotated[bool, typer.Option("--per-residue/--no-per-residue",
                                                help="Write per-Cα MSD files")] = False,
+    max_tau: Annotated[Optional[float], typer.Option("--max-tau",
+                                                      help="Maximum lag time (ps); "
+                                                           "limits frames loaded, not just output")] = None,
     nproc: Annotated[int, typer.Option("--nproc", help="Parallel workers")] = 4,
 ):
     """Calculate per-segment Cα **mean squared displacement** (FFT method).
@@ -223,6 +249,11 @@ def cmd_msd(
         stop (int): Index of the last trajectory frame; ``-1`` means end.
         stride (int): Step between analysed frames.
         per_residue (bool): When ``True``, also write per-Cα MSD files.
+        max_tau (Optional[float]): Truncate the analysis at this lag time
+            (ps) by limiting the number of frames passed to ``EinsteinMSD``.
+            The maximum achievable lag equals ``(n_frames - 1) × dt``, so
+            only ``ceil(max_tau / dt) + 1`` frames are ever read from disk.
+            ``None`` (default) uses all available frames.
         nproc (int): Number of parallel worker processes.
 
     Output:
@@ -231,7 +262,8 @@ def cmd_msd(
 
     Example::
 
-            scical msd --top conf.psf --traj system.xtc --resid 1:50 --outdir ./msd_results --nproc 8
+            scical msd --top conf.psf --traj system.xtc --resid 1:50 \\
+                       --max-tau 5000 --outdir ./msd_results --nproc 8
     """
     import MDAnalysis as mda
 
@@ -253,11 +285,12 @@ def cmd_msd(
     typer.echo(f"[i] Region      : {'resid ' + resid if resid else 'full protein'}")
     typer.echo(f"[i] Frames      : start={start} stop={stop} stride={stride}")
     typer.echo(f"[i] Per-residue : {per_residue}")
+    typer.echo(f"[i] Max tau     : {f'{max_tau} ps' if max_tau is not None else 'all'}")
     typer.echo(f"[i] Output dir  : {outdir}")
     del u
 
     args_list = [
-        (segid, top, traj, resid, start, stop, stride, outdir, per_residue)
+        (segid, top, traj, resid, start, stop, stride, outdir, per_residue, max_tau)
         for segid in segids
     ]
 
