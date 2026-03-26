@@ -523,7 +523,7 @@ from matplotlib.colors import LogNorm, LinearSegmentedColormap
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 
-def plot_hist2d_contour(ax, x, y, bins=50, log_scale=False, contours=False, **kwargs):
+def plot_hist2d(ax, x, y, bins=50, log_scale=False, contours=False, **kwargs):
     """
     Create a 2D histogram with optional contours.
 
@@ -646,6 +646,76 @@ def plot_hist2d_contour(ax, x, y, bins=50, log_scale=False, contours=False, **kw
             pass
 
     return hist, xedges, yedges, cbar_ax
+
+def plot_hist2d_contour(ax, x, y, levels=5, fill_color="steelblue", fill_alpha=0.4,
+                        line_color="steelblue", line_alpha=0.9, linewidths=1.5,
+                        gridsize=100, bw_method="scott",
+):
+    """
+    Plot a 2D histogram as filled contours with contour lines on a given Axes.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+    x, y : array-like of shape (N,)
+    levels : int, float, or array-like
+        - int   → number of auto-spaced levels.
+        - float → single density threshold; fills the region above it.
+        - array → explicit iso-density boundaries (must have >= 2 values).
+    fill_color : str or RGB tuple
+    fill_alpha : float
+    line_color : str or RGB tuple
+    line_alpha : float
+    linewidths : float or sequence of float
+    gridsize : int
+    bw_method : str, scalar, or callable
+
+    Returns
+    -------
+    cf : QuadContourSet  (filled)
+    cl : QuadContourSet  (lines)
+    """
+    import numpy as np
+    from scipy.stats import gaussian_kde
+
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    # Grid with a small padding so the outermost contour closes cleanly
+    pad_x = (x.max() - x.min()) * 0.05
+    pad_y = (y.max() - y.min()) * 0.05
+    xi = np.linspace(x.min() - pad_x, x.max() + pad_x, gridsize)
+    yi = np.linspace(y.min() - pad_y, y.max() + pad_y, gridsize)
+    Xi, Yi = np.meshgrid(xi, yi)
+
+    kde = gaussian_kde(np.vstack([x, y]), bw_method=bw_method)
+    Zi  = kde(np.vstack([Xi.ravel(), Yi.ravel()])).reshape(Xi.shape)
+
+    # ── Normalise `levels` so contourf always receives >= 2 boundaries ────────
+    if np.ndim(levels) == 0:                  # scalar int or float
+        levels = int(levels) if float(levels) == int(levels) else float(levels)
+        if isinstance(levels, int):            # e.g. levels=5  → auto spacing
+            pass                               # let matplotlib handle it
+        else:                                  # e.g. levels=0.0032 → threshold
+            levels = [levels, float(Zi.max())]
+    # array-like: pass through unchanged (user's responsibility to have >= 2)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    cf = ax.contourf(
+        Xi, Yi, Zi,
+        levels=levels,
+        colors=[fill_color],
+        alpha=fill_alpha,
+    )
+    cl = ax.contour(
+        Xi, Yi, Zi,
+        levels=cf.levels,
+        colors=[line_color],
+        alpha=line_alpha,
+        linewidths=linewidths,
+    )
+    return cf, cl
+
 
 class DualYAxis:
     """
