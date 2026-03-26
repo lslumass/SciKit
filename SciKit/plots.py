@@ -648,14 +648,13 @@ def plot_hist2d(ax, x, y, bins=50, log_scale=False, contours=False, **kwargs):
     return hist, xedges, yedges, cbar_ax
 
 
+
 def plot_hist2d_contour(ax, x, y, levels=5, fill_color="steelblue", fill_alpha=0.4,
-                        line_color="steelblue", line_alpha=0.9, linewidths=1.0,
-                        gridsize=100, smooth_sigma=1.5,       # replaces bw_method; controls smoothing kernel
+                        line_color="steelblue", line_alpha=0.9, linewidths=1.5,
+                        gridsize=100, bw_method="scott",
 ):
     """
-    Plot a 2D histogram as filled contours on a given Axes.
-
-    Uses np.histogram2d + gaussian_filter instead of KDE for speed.
+    Plot a 2D histogram as filled contours with contour lines on a given Axes.
 
     Parameters
     ----------
@@ -669,43 +668,54 @@ def plot_hist2d_contour(ax, x, y, levels=5, fill_color="steelblue", fill_alpha=0
     fill_alpha : float
     line_color : str or RGB tuple
     line_alpha : float
-    linewidths : float
+    linewidths : float or sequence of float
     gridsize : int
-        Number of bins along each axis.
-    smooth_sigma : float
-        Std-dev (in bins) of the Gaussian smoothing kernel.
-        Increase for smoother contours, decrease for crisper ones.
+    bw_method : str, scalar, or callable
 
     Returns
     -------
     cf : QuadContourSet  (filled)
     cl : QuadContourSet  (lines)
     """
-    from scipy.ndimage import gaussian_filter
+    import numpy as np
+    from scipy.stats import gaussian_kde
+
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
 
-    # 1. Bin the data
-    counts, xedges, yedges = np.histogram2d(x, y, bins=gridsize)
-
-    # 2. Smooth to get continuous-looking density (fast, O(gridsize²))
-    Zi = gaussian_filter(counts.T, sigma=smooth_sigma)
-
-    # 3. Cell-centre coordinates for the grid
-    xi = 0.5 * (xedges[:-1] + xedges[1:])
-    yi = 0.5 * (yedges[:-1] + yedges[1:])
+    # Grid with a small padding so the outermost contour closes cleanly
+    pad_x = (x.max() - x.min()) * 0.05
+    pad_y = (y.max() - y.min()) * 0.05
+    xi = np.linspace(x.min() - pad_x, x.max() + pad_x, gridsize)
+    yi = np.linspace(y.min() - pad_y, y.max() + pad_y, gridsize)
     Xi, Yi = np.meshgrid(xi, yi)
 
-    # 4. Normalise levels
-    if np.ndim(levels) == 0:
-        levels = int(levels) if float(levels) == int(levels) else float(levels)
-        if not isinstance(levels, int):         # single float threshold
-            levels = [levels, float(Zi.max())]
+    kde = gaussian_kde(np.vstack([x, y]), bw_method=bw_method)
+    Zi  = kde(np.vstack([Xi.ravel(), Yi.ravel()])).reshape(Xi.shape)
 
-    cf = ax.contourf(Xi, Yi, Zi, levels=levels,
-                     colors=[fill_color], alpha=fill_alpha)
-    cl = ax.contour(Xi, Yi, Zi, levels=cf.levels,
-                    colors=[line_color], alpha=line_alpha, linewidths=linewidths)
+    # ── Normalise `levels` so contourf always receives >= 2 boundaries ────────
+    if np.ndim(levels) == 0:                  # scalar int or float
+        levels = int(levels) if float(levels) == int(levels) else float(levels)
+        if isinstance(levels, int):            # e.g. levels=5  → auto spacing
+            pass                               # let matplotlib handle it
+        else:                                  # e.g. levels=0.0032 → threshold
+            levels = [levels, float(Zi.max())]
+    # array-like: pass through unchanged (user's responsibility to have >= 2)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    cf = ax.contourf(
+        Xi, Yi, Zi,
+        levels=levels,
+        colors=[fill_color],
+        alpha=fill_alpha,
+    )
+    cl = ax.contour(
+        Xi, Yi, Zi,
+        levels=cf.levels,
+        colors=[line_color],
+        alpha=line_alpha,
+        linewidths=linewidths,
+    )
     return cf, cl
 
 
