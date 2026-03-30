@@ -541,3 +541,66 @@ def myload(filename, *args, **kwargs):
         results.append(data[:, col])
     results = results + [0, 0, 0, 0, 0, 0, 0, 0]
     return tuple(results)
+
+
+import numpy as np
+
+def get_overlap(x1, y1, x2, y2):
+    """
+    Find the overlapping x region between two datasets, interpolate both
+    onto a common x grid, and return the shared x with corresponding y values.
+
+    Parameters
+    ----------
+    x1 : array-like
+        X-coordinates of the first dataset (assumed sorted ascending).
+    y1 : array-like
+        Y-values corresponding to x1.
+    x2 : array-like
+        X-coordinates of the second dataset (assumed sorted ascending).
+    y2 : array-like
+        Y-values corresponding to x2.
+
+    Returns
+    -------
+    x_overlap : np.ndarray
+        Common x-coordinates within the overlapping range (uses x1's grid).
+    y1_overlap : np.ndarray
+        Y-values from dataset 1 at x_overlap.
+    y2_overlap : np.ndarray
+        Y-values from dataset 2 interpolated onto x_overlap.
+
+    Raises
+    ------
+    ValueError
+        If x1 and x2 have no overlapping region.
+
+    Example
+    -------
+    >>> x1 = [1, 2, 3, 4, 5]
+    >>> y1 = [10, 20, 30, 40, 50]
+    >>> x2 = [3, 4, 5, 6, 7]
+    >>> y2 = [300, 400, 500, 600, 700]
+    >>> x, y1_out, y2_out = get_overlap(x1, y1, x2, y2)
+    >>> # x = [3, 4, 5], y1_out = [30, 40, 50], y2_out = [300, 400, 500]
+    """
+    x1, y1, x2, y2 = map(np.asarray, (x1, y1, x2, y2))
+
+    overlap_start = max(x1.min(), x2.min())  # safer than x1[0], x2[0]
+    overlap_end   = min(x1.max(), x2.max())  # safer than x1[-1], x2[-1]
+
+    if overlap_start > overlap_end:
+        raise ValueError(
+            f"No overlapping region: x1 spans [{x1.min()}, {x1.max()}], "
+            f"x2 spans [{x2.min()}, {x2.max()}]."
+        )
+
+    # Use x1's points within the overlap as the common grid
+    mask1      = (x1 >= overlap_start) & (x1 <= overlap_end)
+    x_overlap  = x1[mask1]
+    y1_overlap = y1[mask1]
+
+    # Interpolate y2 onto the same x grid
+    y2_overlap = np.interp(x_overlap, x2, y2)
+
+    return x_overlap, y1_overlap, y2_overlap
