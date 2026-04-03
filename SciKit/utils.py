@@ -545,35 +545,45 @@ def myload(filename, *args, **kwargs):
 
 import numpy as np
 
+import numpy as np
+
+
 def get_overlap(x1, y1, x2, y2):
     """
-    Find the overlapping x region between two datasets, interpolate both
-    onto a common x grid, and return the shared x with corresponding y values.
+    Find the x values present in both datasets, and return the corresponding
+    y values from each dataset at those shared x positions.
+
+    No interpolation is performed — only x values that literally appear in
+    both x1 and x2 are included in the output. The result is independent of
+    argument order: get_overlap(x1, y1, x2, y2) and get_overlap(x2, y2, x1, y1)
+    will return the same x_overlap (though y1_overlap and y2_overlap will swap).
 
     Parameters
     ----------
     x1 : array-like
-        X-coordinates of the first dataset (assumed sorted ascending).
+        X-coordinates of the first dataset (assumed sorted ascending,
+        no duplicates).
     y1 : array-like
         Y-values corresponding to x1.
     x2 : array-like
-        X-coordinates of the second dataset (assumed sorted ascending).
+        X-coordinates of the second dataset (assumed sorted ascending,
+        no duplicates).
     y2 : array-like
         Y-values corresponding to x2.
 
     Returns
     -------
     x_overlap : np.ndarray
-        Common x-coordinates within the overlapping range (uses x1's grid).
+        X-values present in both x1 and x2, sorted ascending.
     y1_overlap : np.ndarray
         Y-values from dataset 1 at x_overlap.
     y2_overlap : np.ndarray
-        Y-values from dataset 2 interpolated onto x_overlap.
+        Y-values from dataset 2 at x_overlap.
 
     Raises
     ------
     ValueError
-        If x1 and x2 have no overlapping region.
+        If x1 and x2 share no common x values.
 
     Example
     -------
@@ -586,21 +596,16 @@ def get_overlap(x1, y1, x2, y2):
     """
     x1, y1, x2, y2 = map(np.asarray, (x1, y1, x2, y2))
 
-    overlap_start = max(x1.min(), x2.min())  # safer than x1[0], x2[0]
-    overlap_end   = min(x1.max(), x2.max())  # safer than x1[-1], x2[-1]
+    x_overlap = np.intersect1d(x1, x2)  # values present in both, order-independent
 
-    if overlap_start > overlap_end:
+    if len(x_overlap) == 0:
         raise ValueError(
-            f"No overlapping region: x1 spans [{x1.min()}, {x1.max()}], "
+            f"No overlapping x values: x1 spans [{x1.min()}, {x1.max()}], "
             f"x2 spans [{x2.min()}, {x2.max()}]."
         )
 
-    # Use x1's points within the overlap as the common grid
-    mask1      = (x1 >= overlap_start) & (x1 <= overlap_end)
-    x_overlap  = x1[mask1]
-    y1_overlap = y1[mask1]
-
-    # Interpolate y2 onto the same x grid
-    y2_overlap = np.interp(x_overlap, x2, y2)
+    # Index directly — no interpolation needed since both arrays contain these x values
+    y1_overlap = y1[np.isin(x1, x_overlap)]
+    y2_overlap = y2[np.isin(x2, x_overlap)]
 
     return x_overlap, y1_overlap, y2_overlap
