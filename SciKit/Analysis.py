@@ -167,32 +167,18 @@ def _msd_worker(args: tuple):
     if len(ag) == 0:
         raise ValueError(f"No atoms matched: '{selection}'")
 
-    # ── Determine effective stop frame ────────────────────────────────────
-    # _traj_stop converts -1 → None (MDAnalysis convention for "end of traj").
-    # We must guard against comparing int with None.
-    traj_stop = _traj_stop(stop)
-
-    if max_tau is not None:
-        # Effective timestep between analysed frames (ps).
-        dt = u.trajectory.dt * stride
-        # Number of frames needed so that max achievable lag = (n-1)*dt ≤ max_tau.
-        # +1e-9 guards against floating-point undercount when max_tau is an exact
-        # multiple of dt (e.g. max_tau/dt = 4.9999999 instead of 5.0).
-        n_frames_needed = int(max_tau / dt + 1e-9) + 1
-        effective_stop = start + n_frames_needed
-        # Clamp to the user-requested stop; None means "end", so skip the clamp.
-        if traj_stop is not None:
-            effective_stop = min(effective_stop, traj_stop)
-        # If effective_stop overshoots the trajectory length MDAnalysis
-        # silently clamps it, so no further guard is needed.
-    else:
-        effective_stop = traj_stop
+    effective_stop = _traj_stop(stop)
 
     MSD = msd_mod.EinsteinMSD(u, select=selection, msd_type="xyz", fft=True)
     MSD.run(start=start, stop=effective_stop, step=stride)
 
     lagtimes = MSD.results.delta_t_values
     msds     = MSD.results.timeseries
+
+    if max_tau is not None:
+        mask    = lagtimes <= max_tau
+        lagtimes = lagtimes[mask]
+        msds     = msds[mask]
 
     W = 16
     total_file = os.path.join(outdir, f"{segid}_msd.dat")
@@ -205,6 +191,8 @@ def _msd_worker(args: tuple):
 
     if per_residue:
         msds_by_res = MSD.results.msds_by_particle
+        if max_tau is not None:
+            msds_by_res = msds_by_res[mask]  
         resids      = ag.resids
         W2          = 14
         header_res  = " ".join(
