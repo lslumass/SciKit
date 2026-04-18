@@ -2293,30 +2293,41 @@ def cmd_aggr(
 def _s2_parse_index_selection(spec: str, max_index: int) -> list:
     """Parse a segment index selection string into a sorted list of 0-based indices.
 
-    Accepted formats (inclusive on both ends):
-        ``"3"``         → ``[3]``
-        ``"0-4"``       → ``[0, 1, 2, 3, 4]``
-        ``"0-2,5-7"``   → ``[0, 1, 2, 5, 6, 7]``
-        ``"1,3,5"``     → ``[1, 3, 5]``
+    Accepts comma-separated integers and inclusive dash-ranges:
+
+    ==================  ==========================
+    Input               Result
+    ==================  ==========================
+    ``"3"``             ``[3]``
+    ``"0-4"``           ``[0, 1, 2, 3, 4]``
+    ``"0-2,5-7"``       ``[0, 1, 2, 5, 6, 7]``
+    ``"1,3,5"``         ``[1, 3, 5]``
+    ==================  ==========================
 
     Args:
-        spec (str): Selection string from the ``--segments`` argument.
-        max_index (int): Length of the available segment list (for bounds checking).
+        spec (str): Raw selection string from ``--segments``.
+        max_index (int): Number of available segments; valid indices are
+            ``0 … max_index − 1``.
 
     Returns:
         list[int]: Sorted, deduplicated list of valid integer indices.
 
     Raises:
-        ValueError: If any index is out of range or a range token is malformed.
+        ValueError: If any index is outside ``[0, max_index)`` or a range
+            token is syntactically malformed.
     """
     indices = set()
     for token in spec.split(","):
-        token = token.strip()
-        if "-" in token:
-            parts = token.split("-")
-            if len(parts) != 2:
+        token    = token.strip()
+        # Search from position 1 so a hypothetical leading '-' is not
+        # mistaken for a range separator (it would be caught by the bounds
+        # check below, but the parse would be wrong).
+        dash_pos = token.find("-", 1)
+        if dash_pos != -1:
+            lo_str, hi_str = token[:dash_pos], token[dash_pos + 1:]
+            if not lo_str or not hi_str:
                 raise ValueError(f"Invalid range token: {token!r}")
-            lo, hi = int(parts[0]), int(parts[1])
+            lo, hi = int(lo_str), int(hi_str)
             if lo > hi:
                 raise ValueError(f"Range start > end in token: {token!r}")
             indices.update(range(lo, hi + 1))
@@ -2333,62 +2344,97 @@ def _s2_parse_index_selection(spec: str, max_index: int) -> list:
 
 
 def _s2_calc_vs_lag(vectors: np.ndarray, lag_frames: list) -> np.ndarray:
-    """Compute window-averaged S²(τ) for one residue from raw N-H bond vectors.
+    """Compute window-averaged S²(τ) for one residue's backbone N-H bond vectors.
 
-    For each lag τ in *lag_frames*:
+    **Formula**
 
-    1. Slide a window of length τ over the trajectory collecting every
-       possible origin ``t₀ ∈ [0, n_frames − τ)``.
-    2. Compute ``S² = (1/2)(3·Σᵢⱼ<μᵢμⱼ>² − 1)`` inside each window.
-    3. Average S² over all windows → S²(τ).
+    For a window starting at origin ``t₀`` with length τ:
 
-    τ = 0 is **not** handled here; the caller (``_s2_residue_worker``) always
-    writes 1.0 for that row.
+    .. code-block:: text
 
-    All windows for a given τ are stacked into a single ``(n_origins, τ, 3)``
-    array and processed with ``np.einsum`` — there is no Python loop over
-    time origins.
+        M(t₀) = (1/τ) · Σ_{t=t₀}^{t₀+τ-1}  v(t) ⊗ v(t)   [3×3 mean tensor]
+
+        S²(t₀) = ( 3 · ‖M(t₀)‖²_F  −  1 ) / 2
+
+        S²(τ)  = mean over all origins t₀ ∈ [0, n_frames − τ)
+
+    ``‖·‖²_F`` is the Frobenius norm squared (= ``Σᵢⱼ <μᵢ μⱼ>²`` in
+    Lipari-Szabo notation).  Every frame of the trajectory participates in at
+    least one window for every τ ≤ ``n_frames // 2``.
+
+    **Efficiency — prefix-sum approach**
+
+    Naïve window averaging is O(n_origins · τ) per lag (must sum τ frames for
+    each of the n_origins windows).  Here:
+
+    1. Normalise all frame vectors **once** (outside the τ loop).
+    2. Compute the 3×3 outer product ``P[t] = v(t) ⊗ v(t)`` for every frame,
+       flattened to shape ``(n_frames, 9)``.
+    3. Build a prefix-sum table ``cumP`` (shape ``(n_frames+1, 9)``) so that::
+
+           Σ_{t=t₀}^{t₀+τ-1} P[t]  =  cumP[t₀+τ] − cumP[t₀]
+
+    4. For a given τ, obtain all ``n_origins`` window sums with **one NumPy
+       slice** — no Python loop over origins::
+
+           M_sum = cumP[τ : τ+n_origins] − cumP[:n_origins]   # (n_origins, 9)
+
+    Complexity: O(n_frames) pre-processing + O(n_origins) per τ.
+    The speed-up vs. the naïve approach scales with τ; it is largest at the
+    long lags that dominate total runtime.
 
     Args:
         vectors (np.ndarray): Raw (un-normalised) N-H bond vectors,
-            shape ``(n_frames, 3)``.  Normalisation happens per-window.
-        lag_frames (list[int]): Window lengths τ (in frames) to evaluate.
-            All values must be ≥ 2; entries that exceed ``n_frames`` return
-            ``nan``.
+            shape ``(n_frames, 3)``.  Normalisation is performed internally.
+        lag_frames (list[int]): Window lengths τ in frames.  Every entry must
+            satisfy ``2 ≤ τ ≤ n_frames``; entries outside this range receive
+            ``nan`` in the output.
 
     Returns:
-        np.ndarray: S²(τ) for each requested lag, shape ``(len(lag_frames),)``.
-        Entries are in ``[0, 1]``; ``nan`` where τ > n_frames.
+        np.ndarray: S²(τ) values, shape ``(len(lag_frames),)``, dtype
+        ``float64``, clipped to ``[0, 1]``.  ``nan`` for out-of-range τ.
     """
-    n      = len(vectors)
+    n = len(vectors)
+
+    # ── Pre-computation (done once, outside the τ loop) ──────────────────
+
+    # Normalise every frame vector once; per-frame norms are independent of
+    # which window the frame belongs to, so this never needs to be repeated.
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)   # (n, 1)
+    v     = vectors / norms                                   # (n, 3) unit vecs
+
+    # Outer products P[t] = v(t) ⊗ v(t), flattened to (n, 9).
+    # float64 for numerical safety when summing thousands of terms.
+    P = (v[:, :, None] * v[:, None, :]).reshape(n, 9).astype(np.float64)
+
+    # Prefix-sum table: cumP[k] = Σ_{t=0}^{k-1} P[t], cumP[0] = 0.
+    # Shape (n+1, 9); cumP[n] is the sum over all frames (used at τ→n).
+    cumP    = np.empty((n + 1, 9), dtype=np.float64)
+    cumP[0] = 0.0
+    np.cumsum(P, axis=0, out=cumP[1:])
+
     s2_tau = np.full(len(lag_frames), np.nan)
 
+    # ── Per-τ loop (vectorised over all origins) ──────────────────────────
     for i, tau in enumerate(lag_frames):
         if tau < 2 or tau > n:
             continue
-
-        n_origins = n - tau
+        n_origins = n - tau          # windows: t₀ = 0, 1, …, n_origins-1
         if n_origins < 1:
             continue
 
-        # Stack all windows: (n_origins, tau, 3)
-        windows = np.stack(
-            [vectors[t0 : t0 + tau] for t0 in range(n_origins)],
-            axis=0,
-        )
+        # One slice gives all n_origins window sums simultaneously.
+        # M_sum[t₀] = cumP[t₀+τ] − cumP[t₀]  (verified in-bounds:
+        #   max index of cumP accessed = τ + n_origins - 1 + 1
+        #                              = τ + (n - τ - 1) + 1 = n  ✓)
+        M_sum = cumP[tau : tau + n_origins] - cumP[:n_origins]  # (n_origins, 9)
+        M_avg = M_sum / tau                                      # mean tensor
 
-        # Normalise to unit vectors within every window frame
-        norms   = np.linalg.norm(windows, axis=2, keepdims=True)  # (n_origins, tau, 1)
-        windows = windows / norms
+        # ‖M_avg‖²_F = Σⱼ M_avg[w,j]² = Σᵢⱼ <μᵢμⱼ>² per window
+        frob_sq = np.einsum("wi,wi->w", M_avg, M_avg)           # (n_origins,)
 
-        # <μᵢμⱼ> averaged over τ frames for each window: (n_origins, 3, 3)
-        M = np.einsum("wfi,wfj->wij", windows, windows) / tau
-
-        # S²[w] = (3·Σᵢⱼ M[w,i,j]² − 1) / 2  for each window w
-        s2_per_window = (3.0 * np.sum(M * M, axis=(1, 2)) - 1.0) / 2.0
-        s2_per_window = np.clip(s2_per_window, 0.0, 1.0)
-
-        s2_tau[i] = s2_per_window.mean()
+        s2_per_window = np.clip((3.0 * frob_sq - 1.0) / 2.0, 0.0, 1.0)
+        s2_tau[i]     = s2_per_window.mean()
 
     return s2_tau
 
@@ -2396,42 +2442,58 @@ def _s2_calc_vs_lag(vectors: np.ndarray, lag_frames: list) -> np.ndarray:
 def _s2_residue_worker(args: tuple) -> int:
     """Subprocess worker: compute S²(τ) for one residue and write its output file.
 
-    τ = 0 is always written as S² = 1.0 (zero-length window — perfectly ordered
-    by definition).  For all other lags ``_s2_calc_vs_lag`` is called.
+    Designed to run inside ``multiprocessing.Pool.imap_unordered`` or
+    directly in the parent process (serial mode).  Fully self-contained so
+    it can be pickled and sent to worker processes without carrying any
+    MDAnalysis state.
+
+    τ = 0 is prepended to the output and written as S² = 1.0 — the bond
+    vector cannot reorient in zero time so the window is perfectly ordered by
+    definition.  For all other lags :func:`_s2_calc_vs_lag` is called.
+
+    If a residue is absent in a particular segment (e.g. due to chain-length
+    differences) its column is filled with ``nan`` for all lags except τ = 0
+    which is always 1.0.
 
     Args:
-        args (tuple): Packed argument tuple containing:
+        args (tuple): Packed argument tuple:
 
-            - **resid** (*int*) — Residue number.
-            - **vectors_by_segid** (*dict[str, np.ndarray]*) — Mapping of
-              segid → raw N-H bond vectors, shape ``(n_frames, 3)``.
-            - **all_segids** (*list[str]*) — Ordered list of all selected
-              segment IDs (determines column order in the output file).
-            - **lag_frames** (*list[int]*) — Window lengths τ to evaluate
-              (τ = 0 is prepended automatically; these are all ≥ 2).
-            - **out_dir** (*str*) — Output directory path (string, not Path).
+            - **resid** (*int*) — Residue sequence number.
+            - **vectors_by_segid** (*dict[str, np.ndarray]*) — ``{segid:
+              raw_vectors}`` where ``raw_vectors`` has shape
+              ``(n_frames, 3)``.
+            - **all_segids** (*list[str]*) — Ordered segment IDs; determines
+              column order in the output file.
+            - **lag_frames** (*list[int]*) — Window lengths τ ≥ 2 to
+              evaluate; τ = 0 is prepended automatically inside this function.
+            - **out_dir_str** (*str*) — Output directory as a plain string
+              (avoids ``pathlib.Path`` pickle edge-cases on some platforms).
 
     Returns:
-        int: The processed *resid*, for progress tracking in the parent process.
+        int: The processed *resid*, returned to the parent for progress
+        reporting via ``imap_unordered``.
 
     Output:
-        ``<out_dir>/resid_<resid>.dat`` — space-separated columns:
-        ``lag_frame  s2_<segid1>  s2_<segid2>  …``
-        The first row always has ``lag_frame = 0`` and all s2 columns = 1.0.
+        ``<out_dir_str>/resid_<resid>.dat`` — space-separated plain text::
+
+            # lag_frame  s2_PROA  s2_PROB  …
+              0          1.00000000  1.00000000
+              2          0.95123456  0.94801234
+              …
     """
     from pathlib import Path
 
     resid, vectors_by_segid, all_segids, lag_frames, out_dir_str = args
 
+    # τ = 0 always prepended; S² = 1.0 by definition.
     lag_with_zero = [0] + lag_frames
     n_lags        = len(lag_with_zero)
 
-    # Build columns: one per segid
     cols = []
     for segid in all_segids:
-        vecs = vectors_by_segid.get(segid)
-        s2   = np.full(n_lags, np.nan)
-        s2[0] = 1.0                                            # τ = 0 → 1 by definition
+        vecs       = vectors_by_segid.get(segid)
+        s2         = np.full(n_lags, np.nan)
+        s2[0]      = 1.0
         if vecs is not None:
             s2[1:] = _s2_calc_vs_lag(vecs, lag_frames)
         cols.append(s2)
@@ -2440,8 +2502,11 @@ def _s2_residue_worker(args: tuple) -> int:
     header = "lag_frame " + " ".join(f"s2_{seg}" for seg in all_segids)
     fname  = Path(out_dir_str) / f"resid_{resid}.dat"
 
-    np.savetxt(fname, data, header=header,
-               comments="# ", fmt=["%.0f"] + ["%.8f"] * len(all_segids))
+    np.savetxt(
+        fname, data,
+        header=header, comments="# ",
+        fmt=["%.0f"] + ["%.8f"] * len(all_segids),
+    )
     return resid
 
 
@@ -2454,33 +2519,50 @@ def _s2_extract_nh_vectors(
     step: int = 1,
     align_traj: bool = False,
 ) -> dict:
-    """Extract raw backbone N-H bond vectors per (segid, resid) across all frames.
+    """Extract raw backbone N-H bond vectors per ``(segid, resid)`` across frames.
 
-    Proline residues are excluded (no backbone H).  Vectors are **not**
-    normalised here; normalisation is deferred to per-window computation in
-    ``_s2_calc_vs_lag`` so that the raw geometry is preserved.
+    Iterates the trajectory **once** and records the H − N displacement
+    vector for every matched backbone N-H pair.  Proline residues are skipped
+    (no backbone amide H).
+
+    Vectors are stored un-normalised.  Normalisation is deferred to
+    :func:`_s2_calc_vs_lag` where it is performed *once per residue* (outside
+    the τ loop) rather than once per window — O(n_frames) instead of
+    O(n_frames · n_lags).
+
+    **Vectorised extraction** — rather than calling ``atom.position`` once per
+    key per frame (a Python-level loop with one C round-trip per atom), two
+    :class:`~MDAnalysis.core.groups.AtomGroup` objects are built upfront (one
+    for all N atoms, one for all matched H atoms in the same order).  Each
+    frame then requires exactly one ``h_group.positions − n_group.positions``
+    call — a single contiguous NumPy operation regardless of the number of
+    residues.
 
     Args:
-        topology (str): Path to the topology file (.pdb, .psf, .gro, …).
-        trajectory (str): Path to the trajectory file (.xtc, .dcd, .trr, …).
-        selected_segids (Optional[list[str]]): If given, only these segids are
-            extracted; all others are skipped before any frame iteration.
+        topology (str): Path to topology file (.psf, .pdb, .gro, …).
+        trajectory (str): Path to trajectory file (.xtc, .dcd, .trr, …).
+        selected_segids (Optional[list[str]]): If given, only extract vectors
+            for these segment IDs; all others are skipped *before* the frame
+            loop.  ``None`` uses every segment.
         start (int): Index of the first frame to read.
-        stop (Optional[int]): Index of the last frame (``None`` = all frames).
-        step (int): Frame stride when reading the trajectory.
-        align_traj (bool): If ``True``, align each frame to frame 0 on Cα
-            atoms before extracting vectors.  Off by default — only needed
-            when overall tumbling has not already been removed from the
-            trajectory.
+        stop (Optional[int]): Index of the last frame, exclusive
+            (``None`` reads to the end of the trajectory).
+        step (int): Frame stride; every ``step``-th frame is loaded.
+        align_traj (bool): Rigidly superpose each frame onto frame 0 using
+            Cα atoms before collecting vectors.  Off by default — leave
+            disabled when overall rotation/translation has already been
+            removed from the trajectory (the standard case for
+            RMSD-fitted production runs).
 
     Returns:
-        dict: ``{(segid, resid): np.ndarray shape (n_frames, 3)}`` — raw
-        N-H bond vectors (H position minus N position) for every matched
-        backbone N-H pair.
+        dict: ``{(segid, resid): np.ndarray shape (n_frames, 3)}`` of raw
+        H − N displacement vectors in ångström.  Every key shares the same
+        ``n_frames``.
 
     Raises:
-        ValueError: If no backbone N-H pairs are found after applying any
-            segid filter, or if the atom naming is not recognised.
+        ValueError: If no backbone N-H pairs are found (check atom naming:
+            try ``'HN'`` instead of ``'H'``), or if the segid filter leaves
+            no pairs.
     """
     import MDAnalysis as mda
     from MDAnalysis.analysis import align as mda_align
@@ -2491,15 +2573,15 @@ def _s2_extract_nh_vectors(
     if align_traj:
         ref     = mda.Universe(topology, trajectory)
         aligner = mda_align.AlignTraj(
-            u, ref, select="backbone and name CA", in_memory=True
+            u, ref, select="backbone and name CA", in_memory=True,
         )
         aligner.run(start=start, stop=stop, step=step)
 
     sel_N = u.select_atoms("name N and not resname PRO")
     sel_H = u.select_atoms("name H and not resname PRO")
 
-    n_by_key = {(a.segid, a.resid): a for a in sel_N}
-    h_by_key = {(a.segid, a.resid): a for a in sel_H}
+    n_by_key    = {(a.segid, a.resid): a for a in sel_N}
+    h_by_key    = {(a.segid, a.resid): a for a in sel_H}
     shared_keys = sorted(set(n_by_key) & set(h_by_key))
 
     if not shared_keys:
@@ -2521,94 +2603,189 @@ def _s2_extract_nh_vectors(
         typer.echo(f"  Segment {seg!r:>10s} : {count} N-H pairs")
     typer.echo(f"  Total             : {len(shared_keys)} N-H pairs")
 
-    vectors: dict = {k: [] for k in shared_keys}
-    for _ts in u.trajectory[start:stop:step]:
-        for key in shared_keys:
-            n_pos = n_by_key[key].position
-            h_pos = h_by_key[key].position
-            vectors[key].append(h_pos - n_pos)
+    # Build two AtomGroups in matched order so each frame requires exactly
+    # one vectorised positions subtraction instead of len(shared_keys) individual
+    # Python-level atom.position calls.
+    n_indices = [n_by_key[k].index for k in shared_keys]
+    h_indices = [h_by_key[k].index for k in shared_keys]
+    n_group   = u.atoms[n_indices]   # AtomGroup, shape (n_pairs,)
+    h_group   = u.atoms[h_indices]   # AtomGroup, shape (n_pairs,)
 
-    return {key: np.array(vecs) for key, vecs in vectors.items()}
+    # Accumulate: one (n_pairs, 3) array per frame
+    frame_vecs = []
+    for _ts in u.trajectory[start:stop:step]:
+        # Single C-level call; returns a fresh (n_pairs, 3) array
+        frame_vecs.append(h_group.positions - n_group.positions)
+
+    # Stack to (n_frames, n_pairs, 3), then slice per key
+    all_vecs = np.array(frame_vecs)                          # (n_frames, n_pairs, 3)
+    return {key: all_vecs[:, i, :] for i, key in enumerate(shared_keys)}
 
 
 @app.command("time-s2")
 def cmd_time_s2(
-    top: Annotated[str, typer.Option("--top", help="Topology file")] = "conf.psf",
-    traj: Annotated[str, typer.Option("--traj", help="Trajectory file")] = "system.xtc",
-    segments: Annotated[Optional[str], typer.Option("--segments",
-        help="Segment indices to include, e.g. '0-4' or '0,2,5-7' (0-based). "
-             "Omit to use all segments.  Run once without this flag to print "
-             "the full index list, then rerun with a filter.")] = None,
-    min_lag: Annotated[int, typer.Option("--min-lag", help="Minimum window length τ in frames (default: 2)")] = 2,
-    max_lag: Annotated[int, typer.Option("--max-lag", help="Maximum window length τ in frames (-1 = n_frames // 2)")] = -1,
-    stride: Annotated[int, typer.Option("--stride", help="Step between successive τ values written to output (default: 1)")] = 1,
-    start: Annotated[int, typer.Option("--start", help="First trajectory frame to read (default: 0)")] = 0,
-    stop: Annotated[int, typer.Option("--stop", help="Last trajectory frame to read; -1 = all")] = -1,
-    step: Annotated[int, typer.Option("--step", help="Frame stride when reading trajectory (default: 1)")] = 1,
-    align: Annotated[bool, typer.Option("--align/--no-align", help="Align each frame on Cα before computing S² (off by default)")] = False,
-    outdir: Annotated[str, typer.Option("--outdir", help="Output directory (default: s2-time)")] = "s2-time",
-    nproc: Annotated[int, typer.Option("--nproc", help="Number of parallel worker processes (default: 1)")] = 1,
+    top: Annotated[str, typer.Option(
+        "--top", help="Topology file (.psf, .pdb, .gro, …).")] = "conf.psf",
+    traj: Annotated[str, typer.Option(
+        "--traj", help="Trajectory file (.xtc, .dcd, .trr, …).")] = "system.xtc",
+    segments: Annotated[Optional[str], typer.Option(
+        "--segments",
+        help=(
+            "Segment indices to include, 0-based in topology order. "
+            "Formats: '0'  '0-4'  '0-2,5-7'  '1,3,5'. "
+            "Omit to use all segments. "
+            "Run once without this flag to print the full index list."
+        ),
+    )] = None,
+    min_lag: Annotated[int, typer.Option(
+        "--min-lag",
+        help="Minimum window length τ in frames (default: 2).")] = 2,
+    max_lag: Annotated[int, typer.Option(
+        "--max-lag",
+        help=(
+            "Maximum window length τ in frames. "
+            "Always hard-capped at n_frames // 2 — at this cap every "
+            "data point still averages n_frames // 2 windows drawn from "
+            "the full trajectory. "
+            "-1 uses the cap directly (default: -1)."
+        ),
+    )] = -1,
+    lag_stride: Annotated[int, typer.Option(
+        "--lag-stride",
+        help=(
+            "Step between successive τ values written to output "
+            "(default: 1). The hard-cap endpoint is always included."
+        ),
+    )] = 1,
+    start: Annotated[int, typer.Option(
+        "--start",
+        help="First trajectory frame to read (default: 0).")] = 0,
+    stop: Annotated[int, typer.Option(
+        "--stop",
+        help="Last trajectory frame to read; -1 = all frames (default: -1).")] = -1,
+    step: Annotated[int, typer.Option(
+        "--step",
+        help="Frame stride when reading the trajectory (default: 1).")] = 1,
+    align: Annotated[bool, typer.Option(
+        "--align/--no-align",
+        help=(
+            "Align each frame on Cα atoms before extracting vectors "
+            "(default: off). Enable only when overall tumbling has not "
+            "already been removed from the trajectory."
+        ),
+    )] = False,
+    outdir: Annotated[str, typer.Option(
+        "--outdir",
+        help="Output directory; created automatically if absent (default: s2-time)."
+    )] = "s2-time",
+    nproc: Annotated[int, typer.Option(
+        "--nproc",
+        help="Number of parallel worker processes (default: 1).")] = 1,
 ):
     """Compute **time-dependent S²(τ)** order parameters for backbone N-H bonds.
 
-    For each window length τ (in frames):
+    **Physical meaning**
 
-    1. Slide a window of length τ over the trajectory — every possible origin
-       ``t₀ ∈ [0, n_frames − τ)`` is used (analogous to MSD).
-    2. Compute ``S² = (1/2)(3·Σᵢⱼ<μᵢμⱼ>² − 1)`` inside each window using
-       the Lipari-Szabo tensor formula.
-    3. Average S² over all windows → S²(τ).
+    The Lipari-Szabo order parameter S² measures local backbone rigidity from
+    a single number.  S²(τ) extends this: *how ordered does the bond vector
+    appear if observed only over a time window of length τ?*
 
-    τ = 0 is always written as S² = 1.0 (zero-length window, perfectly ordered
-    by definition).  As τ increases, S²(τ) converges to the Lipari-Szabo
-    plateau value.
+    - τ → 0 : S² = 1.0 (no reorientation in zero time).
+    - τ → ∞ : S²(τ) converges to the plateau Lipari-Szabo value.
 
-    Proline residues are skipped (no backbone NH).  Results are written to one
-    file per residue so that per-residue curves can be loaded and plotted
-    independently.
+    The shape of the S²(τ) curve reveals which timescales carry the most
+    orientational disorder.
+
+    **Calculation — window averaging over the full trajectory**
+
+    For each window length τ:
+
+    1. Slide a window of length τ over the *entire* trajectory.  Every
+       possible origin ``t₀ ∈ [0, n_frames − τ)`` contributes one window
+       (the same multi-origin averaging used in MSD calculations).
+    2. Inside each window compute the mean outer-product tensor::
+
+           M(t₀) = (1/τ) · Σ_{t=t₀}^{t₀+τ-1}  v(t) ⊗ v(t)
+
+       where ``v(t)`` is the unit N-H bond vector at frame ``t``.
+    3. Evaluate the Lipari-Szabo formula per window::
+
+           S²(t₀) = ( 3 · ‖M(t₀)‖²_F  −  1 ) / 2
+
+    4. Average over all windows::
+
+           S²(τ) = mean_{t₀} S²(t₀)
+
+    **Hard cap and full-trajectory coverage**
+
+    τ is hard-capped at ``n_frames // 2``.  At this cap there are still
+    ``n_frames // 2`` windows and *every frame* of the trajectory participates
+    in at least one window — the whole trajectory is used for every data point
+    on the S²(τ) curve.  ``--max-lag`` values above the cap are silently
+    clamped; use ``-1`` (default) to select the cap directly.
+
+    **Efficiency**
+
+    *Extraction* — two AtomGroups (all matched N atoms; all matched H atoms)
+    are built once.  Each frame requires a single vectorised
+    ``h_group.positions - n_group.positions`` call regardless of residue count.
+
+    *Computation* — outer products are precomputed once per residue and stored
+    in a prefix-sum table.  Window averages for all origins at a given τ are
+    obtained with a single NumPy slice — O(n_origins) per lag instead of
+    O(n_origins · τ).  Parallelism is over residues (``--nproc``); each
+    worker is fully independent with no inter-process communication.
+
+    **Segment selection**
+
+    Segments are indexed 0-based in topology order.  Run without
+    ``--segments`` to print the full list, then rerun with a filter::
+
+        scical time-s2 --top conf.psf --traj system.xtc
+        # → [0] PROA  [1] PROB  [2] PROC …
+
+        scical time-s2 --top conf.psf --traj system.xtc --segments 0-1
 
     Args:
-        top (str): Path to the topology file (.pdb, .psf, .gro, …).
-        traj (str): Path to the trajectory file (.xtc, .dcd, .trr, …).
-        segments (Optional[str]): Segment index selection string.  Segments
-            are numbered 0-based in topology order.  Run without this flag
-            first to see the full list with indices.
-        min_lag (int): Smallest window length τ to evaluate (frames).
-        max_lag (int): Largest window length τ (frames); ``-1`` uses
-            ``n_frames // 2``, which gives statistically reliable estimates
-            (at least half the trajectory contributes to every average).
-        stride (int): Step between successive τ values in the output.  Use
-            this to reduce output size when many lag points are not needed.
-        start (int): Index of the first trajectory frame to read.
-        stop (int): Index of the last trajectory frame; ``-1`` = all frames.
+        top (str): Topology file path.
+        traj (str): Trajectory file path.
+        segments (Optional[str]): Segment index selection string (see above).
+        min_lag (int): Smallest τ to evaluate in frames (must be ≥ 2).
+        max_lag (int): Largest τ in frames; hard-capped at ``n_frames // 2``.
+            ``-1`` selects the cap directly (default).
+        lag_stride (int): Step between successive τ values written to output.
+            The hard-cap endpoint is always included regardless of stride.
+        start (int): First trajectory frame to read.
+        stop (int): Last trajectory frame; ``-1`` = all frames.
         step (int): Frame stride when reading the trajectory.
-        align (bool): Align each frame on Cα atoms before computing S².
-            Off by default; only enable if tumbling has not been removed.
-        outdir (str): Output directory (created automatically if absent).
-        nproc (int): Number of parallel worker processes.  Parallelism is
-            over residues — each worker handles one residue independently.
+        align (bool): Cα-alignment before vector extraction; off by default.
+        outdir (str): Output directory (created if absent).
+        nproc (int): Parallel worker processes; parallelism is over residues.
 
     Output:
-        ``<outdir>/resid_<N>.dat`` — one file per residue; space-separated
-        columns: ``lag_frame  s2_<segid1>  s2_<segid2>  …``
-        The first data row always has ``lag_frame = 0`` and all s2 = 1.0.
+        One file per residue in ``<outdir>/``, named ``resid_<N>.dat``.
+        Space-separated columns with a ``#``-prefixed header::
+
+            # lag_frame  s2_PROA  s2_PROB  …
+              0          1.00000000  1.00000000
+              2          0.95123456  0.94801234
+              …
 
     Example::
 
-        # See segment list first
+        # Print segment list, then exit
         scical time-s2 --top conf.psf --traj system.xtc
 
-        # Run on segments 0–4, every 10th τ value, 8 workers
+        # Segments 0-1, every 10th τ up to the hard cap, 8 workers
         scical time-s2 --top conf.psf --traj system.xtc \\
-            --segments 0-4 --min-lag 2 --max-lag 5000 --stride 10 \\
+            --segments 0-1 --min-lag 2 --lag-stride 10 \\
             --start 0 --stop -1 --step 1 --outdir s2-time --nproc 8
     """
     import MDAnalysis as mda
-    from pathlib import Path
 
     os.makedirs(outdir, exist_ok=True)
 
-    # ── Resolve segment list and optional filter ───────────────────────────
+    # ── Segment list + optional filter ───────────────────────────────────
     u = mda.Universe(top, traj)
     all_segids = sorted(
         {a.segid for a in u.select_atoms("name N and not resname PRO")}
@@ -2627,38 +2804,71 @@ def cmd_time_s2(
         typer.echo("\nNo --segments filter; using all segments.")
 
     typer.echo(f"Alignment: {'ON (Cα)' if align else 'OFF (default)'}")
+    del u   # release before spawning subprocesses
 
-    # ── Extract N-H vectors ────────────────────────────────────────────────
-    traj_stop = _traj_stop(stop)      # reuse module helper: -1 → None
-
+    # ── Extract N-H vectors ──────────────────────────────────────────────
     typer.echo("\nExtracting N-H vectors …")
     nh_vectors = _s2_extract_nh_vectors(
         top, traj,
         selected_segids=selected_segids,
         start=start,
-        stop=traj_stop,
+        stop=_traj_stop(stop),    # module helper: converts -1 → None
         step=step,
         align_traj=align,
     )
 
-    # ── Build lag frame list ───────────────────────────────────────────────
-    n_frames   = next(iter(nh_vectors.values())).shape[0]
-    eff_max    = max_lag if max_lag != -1 else n_frames // 2
-    lag_frames = list(range(min_lag, eff_max + 1, stride))   # τ=0 added in worker
+    # ── Hard cap: max τ = n_frames // 2 ─────────────────────────────────
+    # At the cap: n_origins = n_frames - n_frames//2 >= n_frames//2.
+    # Every frame participates in ≥1 window, so the full trajectory
+    # contributes to every point on the S²(τ) curve.
+    n_frames = next(iter(nh_vectors.values())).shape[0]
+    hard_cap = n_frames // 2
+
+    if max_lag == -1:
+        eff_max = hard_cap
+    elif max_lag > hard_cap:
+        typer.echo(
+            f"[!] --max-lag {max_lag} exceeds n_frames // 2 = {hard_cap}; "
+            f"clamped to {hard_cap}.",
+            err=True,
+        )
+        eff_max = hard_cap
+    else:
+        eff_max = max_lag
+
+    if eff_max < min_lag:
+        typer.echo(
+            f"[!] Effective max_lag ({eff_max}) < min_lag ({min_lag}); "
+            "nothing to compute.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    # Build lag list; always include eff_max as the final point so the
+    # hard-cap plateau estimate is never accidentally omitted by stride.
+    lag_frames = list(range(min_lag, eff_max, lag_stride))
+    if not lag_frames or lag_frames[-1] != eff_max:
+        lag_frames.append(eff_max)
 
     active_segids = sorted({seg for seg, _ in nh_vectors})
     all_resids    = sorted({rid for _, rid in nh_vectors})
 
-    typer.echo(f"\n[i] n_frames     : {n_frames}")
-    typer.echo(f"[i] lag range    : 0 (fixed=1.0), {min_lag} – {eff_max}, stride={stride}")
-    typer.echo(f"[i] n_lag_points : {len(lag_frames) + 1}  (including τ=0)")
-    typer.echo(f"[i] Segments     : {active_segids}")
-    typer.echo(f"[i] Residues     : {len(all_resids)}")
-    typer.echo(f"[i] Workers      : {nproc}")
-    typer.echo(f"[i] Output dir   : {outdir}/")
+    typer.echo(f"\n[i] n_frames      : {n_frames}")
+    typer.echo(
+        f"[i] hard cap      : n_frames // 2 = {hard_cap}  "
+        f"(≥{n_frames - hard_cap} windows per point; full trajectory always used)"
+    )
+    typer.echo(
+        f"[i] lag range     : 0 (S²=1.0 fixed), "
+        f"{min_lag} – {eff_max}, lag-stride={lag_stride}"
+    )
+    typer.echo(f"[i] n_lag_points  : {len(lag_frames) + 1}  (including τ=0)")
+    typer.echo(f"[i] Segments      : {active_segids}")
+    typer.echo(f"[i] Residues      : {len(all_resids)}")
+    typer.echo(f"[i] Workers       : {nproc}")
+    typer.echo(f"[i] Output dir    : {outdir}/")
 
-    # ── Build per-residue task list ────────────────────────────────────────
-    # Pass out_dir as str (avoids any platform pickle edge-cases with Path).
+    # ── Per-residue task list ────────────────────────────────────────────
     tasks = []
     for resid in all_resids:
         vectors_by_segid = {
@@ -2666,14 +2876,12 @@ def cmd_time_s2(
             for segid in active_segids
             if (segid, resid) in nh_vectors
         }
-        tasks.append(
-            (resid, vectors_by_segid, active_segids, lag_frames, outdir)
-        )
+        tasks.append((resid, vectors_by_segid, active_segids, lag_frames, outdir))
 
     n_tasks      = len(tasks)
     report_every = max(1, n_tasks // 10)
 
-    # ── Dispatch ───────────────────────────────────────────────────────────
+    # ── Dispatch ─────────────────────────────────────────────────────────
     typer.echo("\nComputing S²(τ) …")
 
     if nproc == 1:
