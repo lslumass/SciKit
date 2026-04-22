@@ -460,25 +460,16 @@ def remove_zero(xs, ys):
 
     Returns
     -------
-    x_start : scalar
-        x value slightly to the left of the first non-zero ``ys`` entry
-        (offset by −5 indices).
-    x_end : scalar
-        x value slightly to the right of the last non-zero ``ys`` entry
-        (offset by +5 indices).
-
-    Notes
-    -----
-    The ±5 index offset is hard-coded. If ``xs`` has fewer than 5 elements
-    before the first or after the last non-zero value, an ``IndexError``
-    will be raised. Intended for use with the output of :func:`scatter2hist`
-    to set axis limits that exclude flat zero tails.
+    x_nozero : 1-D array
+        x values within the non-zero support of the distribution.
+    y_nozero : 1-D array
+        Corresponding y values within the non-zero support.
 
     Examples
     --------
     >>> x, y = scatter2hist(distances, num_bin=50, styles='pdf')
-    >>> x_lo, x_hi = remove_zero(x, y)
-    >>> ax.set_xlim(x_lo, x_hi)
+    >>> x_new, y_new = remove_zero(x, y)
+    >>> ax.plot(x_new, y_new)
     """
     for idx in range(len(xs)):
         if ys[idx] != 0:
@@ -488,7 +479,7 @@ def remove_zero(xs, ys):
         if ys[idx] != 0:
             end = idx + 5
             break
-    return xs[start], xs[end]
+    return xs[start:end], ys[start:end]
 
 
 def myload(filename, *args, **kwargs):
