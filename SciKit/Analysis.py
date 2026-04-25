@@ -332,8 +332,8 @@ def _rg_worker(args: tuple):
     segid, topology, trajectory, resid_range, start, stop, stride = args
     u   = mda.Universe(topology, trajectory)
     sel = u.select_atoms(
-        f"segid {segid} and resid {resid_range} and protein"
-        if resid_range else f"segid {segid} and protein"
+        f"segid {segid} and resid {resid_range}"
+        if resid_range else f"segid {segid}"
     )
 
     if len(sel.atoms) == 0:
