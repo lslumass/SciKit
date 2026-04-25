@@ -391,7 +391,7 @@ def cmd_rg(
     segments = [
         seg for seg in u.segments
         if len(seg.atoms.select_atoms(
-            f"resid {resid} and protein" if resid else "protein"
+            f"resid {resid}" if resid else "all"
         )) > 0
     ]
     if not segments:
@@ -400,7 +400,7 @@ def cmd_rg(
 
     segids = [seg.segid for seg in segments]
     typer.echo(f"[i] Segments : {segids}")
-    typer.echo(f"[i] Region   : {'resid ' + resid if resid else 'full protein'}")
+    typer.echo(f"[i] Region   : {'resid ' + resid if resid else 'all'}")
 
     with Pool(nproc) as pool:
         results = pool.map(
