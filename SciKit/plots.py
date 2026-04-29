@@ -843,3 +843,112 @@ def dualY(ax):
     ax1 = DualYAxis(ax,   side='left')
     ax2 = DualYAxis(twin, side='right')
     return ax1, ax2
+
+
+import matplotlib.pyplot as plt
+
+
+def color_text(fig, ax, x, y, parts, colors, sep="", **kwargs):
+    """
+    Draw multi-colored text segments on a Matplotlib Axes object.
+
+    Each string in *parts* is rendered consecutively at the same baseline,
+    with horizontal positions computed automatically from the rendered width
+    of the preceding segment. This makes it easy to style sub-components of
+    a compound label (e.g. ``"aaa-bbb"``) with independent colors.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+        The Figure that contains *ax*. Required for accurate text extent
+        measurement and offset transforms.
+    ax : matplotlib.axes.Axes
+        The Axes on which to draw the text.
+    x : float
+        The x-coordinate of the text anchor in data coordinates.
+    y : float
+        The y-coordinate of the text anchor in data coordinates.
+    parts : tuple of str
+        The text segments to render, in left-to-right order.
+        Example: ``("aaa", "-", "bbb")``
+    colors : tuple of color
+        A color for each segment in *parts*. Must be the same length as
+        *parts*. Accepts any value valid for ``matplotlib.axes.Axes.text``
+        (named colors, hex strings, RGB tuples, etc.).
+        Example: ``("red", "grey", "blue")``
+    sep : str, optional
+        An unstyled separator string inserted between every pair of
+        consecutive segments. Rendered in black. Default is ``""`` (no
+        separator).
+    **kwargs
+        Additional keyword arguments forwarded to every
+        ``matplotlib.axes.Axes.text`` call (e.g. ``fontsize``,
+        ``fontweight``, ``va``, ``ha``, ``transform``).
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If *parts* and *colors* are not the same length.
+
+    Examples
+    --------
+    Single axes:
+
+    >>> fig, ax = plt.subplots()
+    >>> color_text(
+    ...     fig, ax, x=2, y=5,
+    ...     parts=("aaa", "-", "bbb"),
+    ...     colors=("red", "grey", "blue"),
+    ...     fontsize=16,
+    ...     fontweight="bold",
+    ... )
+    >>> plt.show()
+
+    Multiple axes:
+
+    >>> fig, axs = plt.subplots(1, 3)
+    >>> ax = axs[0]
+    >>> color_text(
+    ...     fig, ax, x=2, y=5,
+    ...     parts=("aaa", "-", "bbb"),
+    ...     colors=("red", "grey", "blue"),
+    ...     fontsize=16,
+    ... )
+    >>> plt.show()
+    """
+    from matplotlib import transforms
+
+    if len(parts) != len(colors):
+        raise ValueError(
+            f"'parts' and 'colors' must be the same length, "
+            f"got {len(parts)} and {len(colors)}."
+        )
+
+    transform = kwargs.pop("transform", ax.transData)
+    offset = 0
+
+    for i, (part, color) in enumerate(zip(parts, colors)):
+        text = ax.text(
+            x, y, part,
+            color=color,
+            transform=transforms.offset_copy(transform, fig=fig, x=offset, y=0, units="points"),
+            **kwargs,
+        )
+
+        fig.canvas.draw()
+        bbox = text.get_window_extent()
+        offset += bbox.width / fig.dpi * 72
+
+        if sep and i < len(parts) - 1:
+            sep_text = ax.text(
+                x, y, sep,
+                color="black",
+                transform=transforms.offset_copy(transform, fig=fig, x=offset, y=0, units="points"),
+                **kwargs,
+            )
+            fig.canvas.draw()
+            offset += sep_text.get_window_extent().width / fig.dpi * 72
