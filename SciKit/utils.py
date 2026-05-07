@@ -597,11 +597,41 @@ def get_overlap(x1, y1, x2, y2):
     return x_overlap, y1_overlap, y2_overlap
 
 
-def stack_overlap(arrays):
-    arrays = [np.asarray(arr) for arr in arrays]
-    min_len = min(len(arr) for arr in arrays)
-    result = arrays[0][:min_len]
-    for arr in arrays[1:]:
-        result = np.column_stack((result, arr[:min_len]))
-    
+def stack_jagged(arrays, model="min"):
+    """
+    Stack a list of 1D arrays as columns, aligning on the overlap.
+
+    Parameters
+    ----------
+    arrays : list of array-like
+        Input arrays or lists, can have different lengths.
+    model : {'min', 'max'}, optional
+        'min' : trim all arrays to the shortest length (default).
+        'max' : pad shorter arrays with NaN to match the longest length.
+
+    Returns
+    -------
+    np.ndarray
+        2D array of shape (min_len, n_arrays) if model='min',
+        or (max_len, n_arrays) if model='max'.
+    """
+    arrays = [np.asarray(arr, dtype=float) for arr in arrays]
+
+    if model == "min":
+        target_len = min(len(arr) for arr in arrays)
+        result = arrays[0][:target_len]
+        for arr in arrays[1:]:
+            result = np.column_stack((result, arr[:target_len]))
+
+    elif model == "max":
+        target_len = max(len(arr) for arr in arrays)
+        result = arrays[0]
+        for arr in arrays[1:]:
+            if len(arr) < target_len:
+                arr = np.pad(arr, (0, target_len - len(arr)), constant_values=np.nan)
+            result = np.column_stack((result, arr))
+        if len(result) < target_len:
+            pad = np.full((target_len - len(result), result.shape[1]), np.nan)
+            result = np.vstack((result, pad))
+
     return result
