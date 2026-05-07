@@ -534,11 +534,6 @@ def myload(filename, *args, **kwargs):
     return tuple(results)
 
 
-import numpy as np
-
-import numpy as np
-
-
 def get_overlap(x1, y1, x2, y2):
     """
     Find the x values present in both datasets, and return the corresponding
@@ -600,3 +595,13 @@ def get_overlap(x1, y1, x2, y2):
     y2_overlap = y2[np.isin(x2, x_overlap)]
 
     return x_overlap, y1_overlap, y2_overlap
+
+
+def stack_overlap(arrays):
+    arrays = [np.asarray(arr) for arr in arrays]
+    min_len = min(len(arr) for arr in arrays)
+    result = arrays[0][:min_len]
+    for arr in arrays[1:]:
+        result = np.column_stack((result, arr[:min_len]))
+    
+    return result
