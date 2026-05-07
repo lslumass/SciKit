@@ -619,19 +619,17 @@ def stack_jagged(arrays, model="min"):
 
     if model == "min":
         target_len = min(len(arr) for arr in arrays)
-        result = arrays[0][:target_len]
-        for arr in arrays[1:]:
-            result = np.column_stack((result, arr[:target_len]))
+        arrays = [arr[:target_len] for arr in arrays]
 
     elif model == "max":
         target_len = max(len(arr) for arr in arrays)
-        result = arrays[0]
-        for arr in arrays[1:]:
-            if len(arr) < target_len:
-                arr = np.pad(arr, (0, target_len - len(arr)), constant_values=np.nan)
-            result = np.column_stack((result, arr))
-        if len(result) < target_len:
-            pad = np.full((target_len - len(result), result.shape[1]), np.nan)
-            result = np.vstack((result, pad))
+        arrays = [
+            np.pad(arr, (0, target_len - len(arr)), constant_values=np.nan)
+            for arr in arrays
+        ]
+
+    result = arrays[0]
+    for arr in arrays[1:]:
+        result = np.column_stack((result, arr))
 
     return result
