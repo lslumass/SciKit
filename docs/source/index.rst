@@ -15,6 +15,7 @@ SciKit documentation
    api/plots
    api/utils
    api/tools
+   api/cals
    api/analysis
 
 
