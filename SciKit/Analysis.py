@@ -79,7 +79,10 @@ from scipy.spatial import cKDTree
 from typing_extensions import Annotated
 
 
-warnings.filterwarnings("ignore")
+def _suppress_warnings():
+    import warnings
+    warnings.filterwarnings("ignore")
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Typer application
 # ─────────────────────────────────────────────────────────────────────────────
@@ -154,6 +157,7 @@ def _msd_worker(args: tuple):
         - ``<outdir>/<segid>_CA_msd.dat`` — Per-Cα MSD file (only when
           *per_residue* is ``True``).
     """
+    _suppress_warnings()
     import MDAnalysis as mda
     import MDAnalysis.analysis.msd as msd_mod
 
@@ -259,6 +263,7 @@ def cmd_msd(
             scical msd --top conf.psf --traj system.xtc --resid 1:50 \\
                        --max-tau 5000 --outdir ./msd_results --nproc 8
     """
+    _suppress_warnings()
     import MDAnalysis as mda
 
     os.makedirs(outdir, exist_ok=True)
@@ -401,6 +406,7 @@ def _rg_worker(args: tuple):
         Returns ``(segid, None)`` if no atoms matched or the trajectory slice
         is empty.
     """
+    _suppress_warnings()
     import MDAnalysis as mda
 
     segid, topology, trajectory, resid_range, start, stop, stride = args
@@ -464,6 +470,7 @@ def cmd_rg(
 
             scical rg --top conf.psf --traj system.xtc --sel R001-R010 --out rg.dat --stride 5 --nproc 4
     """
+    _suppress_warnings()
     import MDAnalysis as mda
 
     u = mda.Universe(top, traj)
@@ -550,6 +557,7 @@ def _dssp_worker(args: tuple):
         - **beta** (*np.ndarray | None*) — Per-residue β-strand fraction in
           ``[0, 1]``, shape ``(n_residues,)``.
     """
+    _suppress_warnings()
     import MDAnalysis as mda
     from MDAnalysis.analysis.dssp import DSSP
 
@@ -651,6 +659,7 @@ def cmd_dssp(
 
             scical dssp --top conf.psf --traj system.xtc --hout helicity.dat --bout beta.dat --stride 10 --nproc 4
     """
+    _suppress_warnings()
     import MDAnalysis as mda
 
     u        = mda.Universe(top, traj)
@@ -851,6 +860,7 @@ def _resolve_ca_indices(universe, pairs):
     Raises:
         ValueError: If a ``(resid, segid)`` key matches no Cα atom.
     """
+    _suppress_warnings()
     import MDAnalysis as mda
     unique_res = {}
     for r1, s1, r2, s2 in pairs:
@@ -891,6 +901,7 @@ def _dist_worker(args):
         is a list of absolute trajectory frame numbers and *distances* has
         shape ``(n_pairs, n_frames)`` with values in ångström.
     """
+    _suppress_warnings()
     import MDAnalysis as mda
     topology, trajectory, idx1, idx2, traj_slice, worker_id = args
     w_start, w_stop, stride = traj_slice
@@ -985,6 +996,7 @@ def cmd_dist(
 
             scical distance --top conf.psf --traj system.dcd -f pairs.dat --stride 2 --workers 8
     """
+    _suppress_warnings()
     import MDAnalysis as mda
 
     typer.echo("=" * 60)
@@ -1088,6 +1100,7 @@ def _dist_acf_worker(args: tuple):
         1-D normalised ACF array, or ``None`` if atoms were not found or
         fewer than 2 frames were available.
     """
+    _suppress_warnings()
     import MDAnalysis as mda
 
     (label, topology, trajectory,
@@ -1174,6 +1187,7 @@ def _save_acf(output_file, labels, C_all, topology, trajectory, stride):
         trajectory (str): Path to the trajectory file.
         stride (int): Frame stride used when computing the ACF (scales ``dt``).
     """
+    _suppress_warnings()
     import MDAnalysis as mda
     min_len = min(len(c) for c in C_all)
     C_all   = [c[:min_len] for c in C_all]
@@ -1323,6 +1337,7 @@ def _vec_acf_worker(args: tuple):
         1-D normalised vector ACF, or ``None`` if atoms were not found or
         fewer than 2 frames were available.
     """
+    _suppress_warnings()
     import MDAnalysis as mda
 
     (label, topology, trajectory,
@@ -1517,6 +1532,7 @@ def _contacts_worker(args):
         ``{(cx, cy): {"inter": np.ndarray, "intra": np.ndarray or None}}``
         with partial contact counts accumulated over the assigned frames.
     """
+    _suppress_warnings()
     import MDAnalysis as mda
     from MDAnalysis.lib.distances import capped_distance
 
@@ -1667,9 +1683,8 @@ def cmd_contacts(
             scical contacts --top system.psf --traj traj.dcd \\
                 --components "A:100 B:100" --pairs "A-A A-B" --nproc 8
     """
+    _suppress_warnings()
     import MDAnalysis as mda
-
-    warnings.filterwarnings("ignore")
 
     u      = mda.Universe(top, traj) if traj else mda.Universe(top)
     all_ca = u.select_atoms("name CA")
@@ -1805,6 +1820,7 @@ def _load_universe(top: str, traj: Optional[str] = None):
     Returns:
         MDAnalysis.Universe: The loaded Universe object.
     """
+    _suppress_warnings()
     import MDAnalysis as mda
     return mda.Universe(top, traj) if traj else mda.Universe(top)
 
@@ -2295,6 +2311,7 @@ def _worker(
             ``stats_data``       — list of ``(frame_number, monomers, clusters, max_size)``
             ``density_profiles`` — list of ``(global_rank, r_bins, conc)``
     """
+    _suppress_warnings()
     import MDAnalysis as mda
 
     u                    = _load_universe(top, traj)
@@ -2389,6 +2406,7 @@ def _merge_trajectories(top: str, tmp_paths: list, out_path: str) -> None:
             Must be sorted in frame order (i.e. chunk order).
         out_path (str): Destination XTC path.
     """
+    _suppress_warnings()
     import MDAnalysis as mda
 
     # Load topology only to get n_atoms without opening any trajectory file.
@@ -2475,6 +2493,7 @@ def cmd_aggr(
         scical aggr --top conf.psf --traj system.xtc --rcut 8.0 --sel R001-R099 \\
             --recenter --density --dr 2.0 --n-frames-avg 100 --nproc 8
     """
+    _suppress_warnings()
     import MDAnalysis as mda
 
     # Guard: density requires recentering
@@ -2975,6 +2994,7 @@ def _s2_extract_nh_vectors(
             try ``'HN'`` instead of ``'H'``), or if the segid filter leaves
             no pairs.
     """
+    _suppress_warnings()
     import MDAnalysis as mda
     from MDAnalysis.analysis import align as mda_align
     from collections import Counter
@@ -3192,6 +3212,7 @@ def cmd_time_s2(
             --segments 0-1 --min-lag 2 --lag-stride 10 \\
             --start 0 --stop -1 --step 1 --outdir s2-time --nproc 8
     """
+    _suppress_warnings()
     import MDAnalysis as mda
 
     os.makedirs(outdir, exist_ok=True)
