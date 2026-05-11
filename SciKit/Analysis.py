@@ -1766,24 +1766,32 @@ def _parse_segname(name: str) -> tuple:
 def _expand_range(start_name: str, end_name: str) -> list:
     """Expand a segment-name range into a list of segment name strings.
 
-    Both endpoints must share the same alphabetic prefix.  Zero-padding
-    width is taken from the **start** endpoint, which establishes the naming
-    convention for the entire range.
+    Both endpoints must share the same alphabetic prefix.  The zero-padding
+    width is taken from the **start** endpoint and applied uniformly to all
+    generated names.  Python's format specification naturally handles numbers
+    whose digit count exceeds the width (no truncation occurs).
+
+    A consistency check verifies that the generated name for the end number
+    matches the provided *end_name*; a mismatch indicates inconsistent
+    zero-padding between endpoints.
 
     Args:
         start_name (str): First segment name in the range (e.g. ``"R001"``).
-        end_name (str): Last segment name in the range (e.g. ``"R099"``).
+        end_name (str): Last segment name in the range (e.g. ``"R090"``).
 
     Returns:
         list[str]: Expanded segment names, inclusive of both endpoints.
 
     Raises:
-        ValueError: If prefixes differ or start > end.
+        ValueError: If prefixes differ, start > end, or padding is
+            inconsistent between endpoints.
 
     Examples::
 
-        _expand_range("R001", "R003")  # → ["R001", "R002", "R003"]
-        _expand_range("K01", "K10")    # → ["K01", "K02", …, "K10"]
+        _expand_range("R001", "R090")  # → ["R001", "R002", …, "R090"]
+        _expand_range("R01", "R09")    # → ["R01", "R02", …, "R09"]
+        _expand_range("R1", "R20")     # → ["R1", "R2", …, "R9", "R10", …, "R20"]
+        _expand_range("R1", "R9")      # → ["R1", "R2", …, "R9"]
     """
     start_prefix, start_num, start_width = _parse_segname(start_name)
     end_prefix,   end_num,   end_width   = _parse_segname(end_name)
@@ -1800,13 +1808,20 @@ def _expand_range(start_name: str, end_name: str) -> list:
             f"Range start > end: '{start_name}' > '{end_name}'"
         )
 
-    # Use the start endpoint's width as the canonical zero-padding.
-    # If the end has more digits purely because the number is larger
-    # (e.g. R99 → R100), use the end width instead so all names are
-    # representable.
-    width = start_width if end_num < 10 ** start_width else end_width
+    # Validate that end_name matches what we would generate using start_width.
+    # f"{num:0{width}d}" pads to at least `width` digits but never truncates.
+    generated_end = f"{start_prefix}{end_num:0{start_width}d}"
+    if generated_end != end_name:
+        raise ValueError(
+            f"Inconsistent zero-padding in range '{start_name}-{end_name}': "
+            f"start uses width {start_width}, which would produce "
+            f"'{generated_end}' for the end number, not '{end_name}'. "
+            f"Use '{start_name}-{generated_end}' or "
+            f"'{start_prefix}{start_num:0{end_width}d}-{end_name}'."
+        )
 
-    return [f"{start_prefix}{num:0{width}d}" for num in range(start_num, end_num + 1)]
+    return [f"{start_prefix}{num:0{start_width}d}"
+            for num in range(start_num, end_num + 1)]
 
 
 def _parse_sel(sel: Optional[str], u) -> list:
@@ -1848,7 +1863,7 @@ def _parse_sel(sel: Optional[str], u) -> list:
     if sel is None:
         return list(range(len(u.segments)))
 
-    # Build lookup: segid → universe segment index
+    # Build lookup: segid → universe segment index.
     segid_to_idx: dict = {}
     for i, seg in enumerate(u.segments):
         segid_to_idx[seg.segid] = i
@@ -1861,30 +1876,20 @@ def _parse_sel(sel: Optional[str], u) -> list:
         if not token:
             continue
 
-        # Determine whether this token is a range (contains '-' between two
-        # valid segment names) or a single segment name.
-        # Strategy: try to split on '-' and validate both halves.  If the
-        # token contains no '-', or splitting gives != 2 parts, treat it as
-        # a single name.
+        # Split on '-' to detect ranges vs single names.
         parts = token.split("-")
 
         if len(parts) == 2:
-            # Potential range — validate both parts
+            # Range: "R001-R099"
             left  = parts[0].strip()
             right = parts[1].strip()
-            try:
-                names = _expand_range(left, right)
-            except ValueError:
-                # Not a valid range — might be a single segment with '-' in
-                # topology (unusual).  Fall through to single-name handling.
-                # But since _parse_segname disallows '-', raise clearly.
-                raise
+            names = _expand_range(left, right)
         elif len(parts) == 1:
-            # Single segment name
+            # Single segment name: "R001"
             _parse_segname(token)  # validate format; raises on failure
             names = [token]
         else:
-            # More than one '-' — ambiguous.  Require comma separation.
+            # More than one '-' — ambiguous
             raise ValueError(
                 f"Ambiguous token '{token}': use comma-separated ranges "
                 f"(e.g. 'R001-R099,K001-K010'), not 'R001-R099-K001-K010'."
@@ -2377,7 +2382,7 @@ def cmd_aggr(
             --sel R001-R099,K001-K010
 
         # Single segment
-        scical aggr --top conf.psf --traj system.xtc --rcut 8.0 --sel R001-R001
+        scical aggr --top conf.psf --traj system.xtc --rcut 8.0 --sel R001
 
         # 8 workers — with PBC recentering and radial density
         scical aggr --top conf.psf --traj system.xtc --rcut 8.0 --sel R001-R099 \\
@@ -2603,7 +2608,7 @@ def cmd_aggr(
     if recenter:
         typer.echo(f"Recentered trajectory -> {outtraj}")
     typer.echo("DONE!")
-    
+
 
 # =============================================================================
 #  ░░  9.  Time-dependent S²  ░░
