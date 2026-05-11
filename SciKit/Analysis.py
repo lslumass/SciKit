@@ -1699,70 +1699,127 @@ def cmd_contacts(
 
 AVOGADRO = 6.022e23
 """float: Avogadro's number (mol⁻¹), used for concentration unit conversion."""
- 
- 
+
+
 # ---------------------------------------------------------------------------
 #  Universe helpers
 # ---------------------------------------------------------------------------
- 
+
 def _load_universe(top: str, traj: Optional[str] = None):
     """Load an MDAnalysis Universe with or without a trajectory.
- 
+
     Args:
         top (str): Path to the topology file.
         traj (Optional[str]): Path to the trajectory file, or ``None`` to
             load only the single frame embedded in *top*.
- 
+
     Returns:
         MDAnalysis.Universe: The loaded Universe object.
     """
     import MDAnalysis as mda
     return mda.Universe(top, traj) if traj else mda.Universe(top)
- 
- 
-def _grp_init(u, ref_atom: str = "CA", step: int = 1):
+
+
+def _parse_sel(sel: Optional[str], n_segs: int) -> list:
+    """Parse a segment-range string into a list of universe segment indices.
+
+    Args:
+        sel (Optional[str]): Inclusive range string such as ``"0-99"``, or
+            ``None`` to select all segments.
+        n_segs (int): Total number of segments in the Universe.
+
+    Returns:
+        list[int]: Sorted list of zero-based universe segment indices.
+
+    Raises:
+        ValueError: If *sel* is malformed or the indices are out of range.
+
+    Examples::
+
+        _parse_sel("0-99",   200)  # → [0, 1, …, 99]
+        _parse_sel("50-149", 200)  # → [50, 51, …, 149]
+        _parse_sel(None,     200)  # → [0, 1, …, 199]
+    """
+    if sel is None:
+        return list(range(n_segs))
+
+    try:
+        lo_str, hi_str = sel.split("-")
+        lo, hi = int(lo_str), int(hi_str)
+    except ValueError:
+        raise ValueError(
+            f"--sel must be 'START-STOP' (e.g. '0-99'), got: {sel!r}"
+        )
+
+    if lo < 0 or hi >= n_segs or lo > hi:
+        raise ValueError(
+            f"--sel '{sel}' is out of range for a universe with {n_segs} segments "
+            f"(valid range: 0-{n_segs - 1})."
+        )
+
+    return list(range(lo, hi + 1))
+
+
+def _grp_init(u, ref_atom: str = "CA", step: int = 1,
+              sel_indices: Optional[list] = None):
     """Initialise per-segment reference-atom groups for clustering.
- 
+
+    Only the segments listed in *sel_indices* are included in the returned
+    groups.  The caller uses the returned *sel_indices* to translate a local
+    cluster index (position within *segs*) back to a universe-level segment
+    index, which is what :func:`_recenter_frame` and :func:`_unwrap_cluster`
+    expect.
+
     Args:
         u (MDAnalysis.Universe): Loaded Universe.
         ref_atom (str): Name of the reference atom (default: ``"CA"``).
         step (int): Sub-sampling step applied within each segment's reference
             atoms.
- 
+        sel_indices (Optional[list[int]]): Universe-level segment indices to
+            include in clustering.  ``None`` selects every segment.
+
     Returns:
-        tuple[list[AtomGroup], np.ndarray]:
- 
-        - **segs** — List of ``AtomGroup`` objects, one per segment.
+        tuple[list[AtomGroup], np.ndarray, list[int]]:
+
+        - **segs** — List of ``AtomGroup`` objects, one per *selected* segment.
         - **grps** — Integer array of initial group IDs, shape
-          ``(n_segments,)``.
+          ``(n_selected,)``.
+        - **sel_indices** — The resolved universe-level segment indices.
+          ``sel_indices[i]`` is the universe index of ``segs[i]``.
     """
+    if sel_indices is None:
+        sel_indices = list(range(len(u.segments)))
+
     segs, grps = [], []
-    for i, segid in enumerate(u.segments):
-        cas = u.select_atoms(f"segid {segid.segid} and name {ref_atom}")
-        seg = cas[::step].atoms.select_atoms(f"name {ref_atom}")
+    for i, seg_idx in enumerate(sel_indices):
+        segid = u.segments[seg_idx].segid
+        cas   = u.select_atoms(f"segid {segid} and name {ref_atom}")
+        seg   = cas[::step].atoms.select_atoms(f"name {ref_atom}")
         segs.append(seg)
         grps.append(i)
-    return segs, np.array(grps)
- 
- 
+
+    return segs, np.array(grps), sel_indices
+
+
 # ---------------------------------------------------------------------------
 #  Cluster detection
 # ---------------------------------------------------------------------------
- 
+
 def _find_clusters_and_stats(segs, grps, r_cutoff: float = 8.0):
     """Detect aggregation clusters via union-find with kd-tree contact search.
- 
+
     Args:
         segs (list[AtomGroup]): Reference-atom groups, one per segment.
         grps (np.ndarray): Initial group-ID array of shape ``(n_segments,)``.
             This array is **not** mutated; a copy is taken internally.
         r_cutoff (float): Contact distance cutoff in ångström.
- 
+
     Returns:
         tuple:
- 
+
         - **clusters** (*list[list[int]]*) — Each cluster is a list of
-          segment indices.
+          **local** indices into *segs* (i.e. positions within the list
+          passed in, not universe segment indices).
         - **monomer** (*int*) — Number of isolated single-segment clusters.
         - **n_clusters** (*int*) — Number of multi-segment clusters.
         - **max_cluster_size** (*int*) — Size of the largest cluster.
@@ -1770,7 +1827,7 @@ def _find_clusters_and_stats(segs, grps, r_cutoff: float = 8.0):
     """
     nmol = len(segs)
     grps = grps.copy()          # never mutate the caller's array
- 
+
     for i in range(nmol - 1):
         tree_i = cKDTree(segs[i].positions)
         grp_i  = grps[i]
@@ -1782,34 +1839,35 @@ def _find_clusters_and_stats(segs, grps, r_cutoff: float = 8.0):
             if any(len(nb) > 0 for nb in neighbors):
                 grps  = np.where(grps == grp_j, grp_i, grps)
                 grp_i = grps[i]
- 
+
     aggr: dict = {}
     for g in grps:
         aggr[g] = aggr.get(g, 0) + 1
- 
+
     monomer          = sum(1 for v in aggr.values() if v == 1)
     n_clusters       = len(aggr) - monomer
     max_cluster_size = max(aggr.values())
- 
+
     clusters: dict = {}
     for seg_idx, cid in enumerate(grps):
         clusters.setdefault(cid, []).append(seg_idx)
- 
+
     return list(clusters.values()), monomer, n_clusters, max_cluster_size, grps
- 
- 
+
+
 # ---------------------------------------------------------------------------
 #  PBC recentering
 # ---------------------------------------------------------------------------
- 
+
 def _unwrap_cluster(u, cluster_seg_indices: list, box: np.ndarray) -> dict:
     """Unwrap a cluster split across periodic boundaries using BFS.
- 
+
     Args:
         u (MDAnalysis.Universe): Universe at the current trajectory frame.
-        cluster_seg_indices (list[int]): Indices of segments in the cluster.
+        cluster_seg_indices (list[int]): **Universe-level** indices of segments
+            in the cluster.
         box (np.ndarray): Simulation cell dimensions, shape ``(6,)``.
- 
+
     Returns:
         dict[int, np.ndarray]: ``{seg_index: shift_vector}`` — shift each
         segment's positions by this vector to place it in the same image as
@@ -1819,11 +1877,11 @@ def _unwrap_cluster(u, cluster_seg_indices: list, box: np.ndarray) -> dict:
     shifts   = {cluster_seg_indices[0]: np.zeros(3)}
     queue    = deque([cluster_seg_indices[0]])
     visited  = {cluster_seg_indices[0]}
- 
+
     while queue:
         ref_idx = queue.popleft()
         ref_com = (u.segments[ref_idx].atoms.positions + shifts[ref_idx]).mean(axis=0)
- 
+
         for seg_idx in cluster_seg_indices:
             if seg_idx in visited:
                 continue
@@ -1838,18 +1896,22 @@ def _unwrap_cluster(u, cluster_seg_indices: list, box: np.ndarray) -> dict:
             shifts[seg_idx] = shifts[ref_idx] + shift
             visited.add(seg_idx)
             queue.append(seg_idx)
- 
+
     return shifts
- 
- 
+
+
 def _recenter_frame(u, largest_cluster: list, box: np.ndarray) -> np.ndarray:
     """Unwrap the largest cluster, translate its CoM to the box centre, re-wrap.
- 
+
+    Always operates on **all** atoms in the universe — the selection only
+    determines which segments define the centre-of-mass reference.
+
     Args:
         u (MDAnalysis.Universe): Universe at the current trajectory frame.
-        largest_cluster (list[int]): Segment indices of the largest cluster.
+        largest_cluster (list[int]): **Universe-level** segment indices of the
+            largest cluster.
         box (np.ndarray): Simulation cell dimensions, shape ``(6,)``.
- 
+
     Returns:
         np.ndarray: New position array for **all** atoms in *u*, shape
         ``(n_atoms, 3)``.  The Universe is **not** mutated by this function.
@@ -1857,67 +1919,70 @@ def _recenter_frame(u, largest_cluster: list, box: np.ndarray) -> np.ndarray:
     box_center = box[:3] / 2.0
     shifts     = _unwrap_cluster(u, largest_cluster, box)
     new_pos    = u.atoms.positions.copy()
- 
+
     for seg_idx in largest_cluster:
         idx          = u.segments[seg_idx].atoms.indices
         new_pos[idx] += shifts[seg_idx]
- 
+
     cluster_atom_indices = [
         i for seg_idx in largest_cluster
         for i in u.segments[seg_idx].atoms.indices
     ]
     center_shift  = box_center - new_pos[cluster_atom_indices].mean(axis=0)
     new_pos      += center_shift
- 
+
     for dim in range(3):
         new_pos[:, dim] %= box[dim]
- 
+
     return new_pos
- 
- 
+
+
 # ---------------------------------------------------------------------------
 #  Radial density
 # ---------------------------------------------------------------------------
- 
+
 def _radial_density(u, droplet_center: np.ndarray, ca_per_segment: int,
                     ref_atom: str = "CA",
                     r_max: float = 100.0, dr: float = 1.0) -> tuple:
     """Compute the radial monomer concentration profile centred on a droplet.
- 
+
+    Always operates on **all** atoms matching *ref_atom* in the universe.
+
     Args:
         u (MDAnalysis.Universe): Universe at the current (recentered) frame.
         droplet_center (np.ndarray): 3-D Cartesian coordinates of the droplet
             centre, in ångström.
-        ca_per_segment (int): Number of reference atoms per monomer.
+        ca_per_segment (int): Number of reference atoms per monomer (derived
+            from the selected species, not the full universe).
         ref_atom (str): Reference atom name (default: ``"CA"``).
         r_max (float): Maximum radius, in ångström.
         dr (float): Radial bin width, in ångström.
- 
+
     Returns:
         tuple[np.ndarray, np.ndarray]:
- 
+
         - **r_bins** — Bin centres, shape ``(n_bins,)``, in ångström.
         - **concentration** — Monomer concentration per shell, in mM.
     """
     all_ca    = u.select_atoms(f"name {ref_atom}")
     distances = np.linalg.norm(all_ca.positions - droplet_center, axis=1)
- 
+
     n_bins = int(r_max / dr)
     bins   = np.linspace(0, r_max, n_bins + 1)
     r_bins = (bins[:-1] + bins[1:]) / 2.0
- 
+
     ca_counts, _   = np.histogram(distances, bins=bins)
     monomer_counts = ca_counts / ca_per_segment
     shell_vols     = (4.0 / 3.0) * np.pi * (bins[1:] ** 3 - bins[:-1] ** 3)
     concentration  = (monomer_counts / shell_vols) * (1e30 / AVOGADRO)
- 
+
     return r_bins, concentration
- 
- 
+
+
 # ---------------------------------------------------------------------------
 #  Parallel worker
 # ---------------------------------------------------------------------------
- 
+
 def _worker(
     top: str,
     traj: str,
@@ -1932,14 +1997,18 @@ def _worker(
     n_frames_total: int,         # total number of analysed frames across all workers
     chunk_start_rank: int,       # global rank of traj_indices[0] among analysed frames
     tmp_traj: Optional[str],     # path for this worker's temporary XTC, or None
+    sel_indices: list,           # universe-level segment indices used for clustering
 ) -> dict:
     """Analyse a contiguous subset of frames in a subprocess.
- 
+
     Each worker opens its own Universe — ``mda.Universe`` is not picklable
     and cannot be shared across processes.  Frames are accessed by absolute
     trajectory index so that any start/stop/stride combination is handled
     correctly regardless of how frame numbers are stored in the XTC.
- 
+
+    Clustering is restricted to *sel_indices*.  Recentering and radial density
+    always act on the **full** universe.
+
     Args:
         top (str): Topology file path.
         traj (str): Trajectory file path.
@@ -1955,49 +2024,67 @@ def _worker(
         chunk_start_rank (int): Global rank of this chunk's first frame.
         tmp_traj (Optional[str]): Path to write the recentered trajectory
             fragment, or ``None`` if recentering is disabled.
- 
+        sel_indices (list[int]): Universe-level segment indices to use for
+            clustering.  Passed straight through to :func:`_grp_init`.
+
     Returns:
         dict:
             ``stats_data``       — list of ``(frame_number, monomers, clusters, max_size)``
             ``density_profiles`` — list of ``(global_rank, r_bins, conc)``
     """
     import MDAnalysis as mda
- 
-    u              = _load_universe(top, traj)
-    segs, _        = _grp_init(u, ref_atom=ref, step=castep)
-    ca_per_segment = len(u.segments[0].atoms.select_atoms(f"name {ref}"))
- 
+
+    u                    = _load_universe(top, traj)
+    segs, _, sel_indices = _grp_init(u, ref_atom=ref, step=castep,
+                                     sel_indices=sel_indices)
+
+    # Use the first *selected* segment so ca_per_segment reflects the correct
+    # molecule type even when sel_indices does not start at 0.
+    ca_per_segment = len(
+        u.segments[sel_indices[0]].atoms.select_atoms(f"name {ref}")
+    )
+
     stats_data:       list = []
     density_profiles: list = []
- 
+
     writer = mda.Writer(tmp_traj, n_atoms=u.atoms.n_atoms) if (recenter and tmp_traj) else None
- 
+
     try:
         for local_rank, traj_idx in enumerate(traj_indices):
             u.trajectory[traj_idx]              # seek by absolute index
             ts  = u.trajectory.ts
             box = ts.dimensions.copy()          # copy — dimensions can be a mutable view
- 
+
             # Reset group labels every frame; never carry state between frames.
             grps_frame = np.arange(len(segs))
- 
+
             for seg in segs:
                 seg.wrap()
- 
+
+            # ── Clustering: selected segments only ─────────────────────────
+            # clusters contains lists of LOCAL indices (0…len(segs)-1).
             clusters, monomer, n_clusters, max_size, _ = _find_clusters_and_stats(
                 segs, grps_frame, r_cutoff=rcut
             )
- 
+
             if recenter:
-                largest           = max(clusters, key=len)
-                u.atoms.positions = _recenter_frame(u, largest, box)
+                # Translate local cluster indices → universe-level segment
+                # indices.  _recenter_frame / _unwrap_cluster both call
+                # u.segments[seg_idx] directly and must receive universe
+                # indices.  The functions themselves always move ALL atoms.
+                largest_local = max(clusters, key=len)
+                largest_univ  = [sel_indices[i] for i in largest_local]
+
+                # ── Recentering: full universe ─────────────────────────────
+                u.atoms.positions = _recenter_frame(u, largest_univ, box)
                 if writer:
                     writer.write(u.atoms)
- 
+
                 if density:
                     global_rank = chunk_start_rank + local_rank
                     if global_rank >= n_frames_total - n_frames_avg:
                         r_max = float(np.min(box[:3]) / 2.0)
+                        # ── Density: full universe ─────────────────────────
                         r_bins, conc = _radial_density(
                             u,
                             droplet_center=box[:3] / 2.0,
@@ -2007,32 +2094,32 @@ def _worker(
                             dr=dr,
                         )
                         density_profiles.append((global_rank, r_bins, conc))
- 
+
             stats_data.append((ts.frame, monomer, n_clusters, max_size))
- 
+
     finally:
         if writer is not None:
             writer.close()
- 
+
     return {
         "stats_data":       stats_data,
         "density_profiles": density_profiles,
     }
- 
- 
+
+
 # ---------------------------------------------------------------------------
 #  Trajectory merge
 # ---------------------------------------------------------------------------
- 
+
 def _merge_trajectories(top: str, tmp_paths: list, out_path: str) -> None:
     """Concatenate per-worker XTC fragments into a single output trajectory.
- 
+
     Workers receive **contiguous** frame chunks, so sequential concatenation
     preserves the original frame order exactly.
- 
+
     ``writer.write(tmp_u.atoms)`` copies both atom positions and the current
     ``ts.dimensions`` into the output file — no manual dimension copy needed.
- 
+
     Args:
         top (str): Topology file path (used only to determine atom count).
         tmp_paths (list[str]): Ordered list of per-worker XTC paths.
@@ -2040,10 +2127,10 @@ def _merge_trajectories(top: str, tmp_paths: list, out_path: str) -> None:
         out_path (str): Destination XTC path.
     """
     import MDAnalysis as mda
- 
+
     # Load topology only to get n_atoms without opening any trajectory file.
     n_atoms = _load_universe(top).atoms.n_atoms
- 
+
     with mda.Writer(out_path, n_atoms=n_atoms) as wout:
         for tmp_path in tmp_paths:
             tmp_u = _load_universe(top, tmp_path)
@@ -2051,12 +2138,12 @@ def _merge_trajectories(top: str, tmp_paths: list, out_path: str) -> None:
                 # write() reads positions AND ts.dimensions from tmp_u directly
                 wout.write(tmp_u.atoms)
             os.remove(tmp_path)
- 
- 
+
+
 # ---------------------------------------------------------------------------
 #  CLI command
 # ---------------------------------------------------------------------------
- 
+
 @app.command("aggr")
 def cmd_aggr(
     top:     Annotated[str,  typer.Option("--top",     help="Topology file (PSF)")] = "conf.psf",
@@ -2077,68 +2164,101 @@ def cmd_aggr(
     dr:           Annotated[float, typer.Option("--dr",           help="Radial bin width (Å)")] = 2.0,
     n_frames_avg: Annotated[int,   typer.Option("--n-frames-avg", help="Last N frames averaged for density profile")] = 50,
     nproc:        Annotated[int,   typer.Option("--nproc",        help="Number of parallel worker processes (1 = serial)")] = 1,
+    sel:          Annotated[Optional[str], typer.Option(
+                      "--sel",
+                      help=(
+                          "Segment index range for clustering, inclusive "
+                          "(e.g. '0-99'). Only these segments contribute to "
+                          "aggregation statistics. Recentering and density "
+                          "profiles always use the full system. "
+                          "Default: all segments."
+                      ),
+                  )] = None,
 ):
     """Analyse protein **aggregation**: cluster detection, PBC recentering, and radial density.
- 
+
     Processes each trajectory frame to:
- 
+
     1. **Cluster** — detect multi-chain aggregates using kd-tree contact search
        on reference atoms (default: Cα), with a union-find merging scheme.
+       Only the segments selected by ``--sel`` are considered.
     2. **Recenter** *(optional, ``--recenter``)* — unwrap the largest cluster
        across PBC and translate it to the box centre; write as a new trajectory.
+       Always applied to the **full** system.
     3. **Density profile** *(optional, ``--density``, requires ``--recenter``)* —
        compute and average the radial monomer concentration (mM) over the last
-       ``--n-frames-avg`` frames.
- 
+       ``--n-frames-avg`` frames.  Always computed from the **full** system.
+
     Parallelism is over frames (``--nproc``): each worker process handles a
     contiguous chunk of the trajectory and writes its own temporary XTC fragment,
     which are merged in order at the end.
- 
+
     Example::
- 
-        # Serial — cluster statistics only
-        scical aggr --top conf.psf --traj system.xtc --rcut 8.0
- 
+
+        # Serial — cluster statistics only, proteins are segments 0-99
+        scical aggr --top conf.psf --traj system.xtc --rcut 8.0 --sel 0-99
+
         # 8 workers — with PBC recentering and radial density
-        scical aggr --top conf.psf --traj system.xtc --rcut 8.0 \\
+        scical aggr --top conf.psf --traj system.xtc --rcut 8.0 --sel 0-99 \\
             --recenter --density --dr 2.0 --n-frames-avg 100 --nproc 8
     """
     import MDAnalysis as mda
- 
+
     # Guard: density requires recentering
     if density and not recenter:
         typer.echo("[!] --density requires --recenter — density disabled.", err=True)
         density = False
- 
+
     typer.echo("Loading trajectory...")
     u = _load_universe(top, traj)
- 
+
+    # ── Resolve segment selection ──────────────────────────────────────────
+    # sel_indices is a list of universe-level segment indices.
+    # All downstream code uses this list to restrict clustering; recentering
+    # and density always operate on the full universe.
+    try:
+        sel_indices = _parse_sel(sel, len(u.segments))
+    except ValueError as exc:
+        typer.echo(f"[!] {exc}", err=True)
+        raise typer.Exit(1)
+
     # Build the list of absolute trajectory indices to analyse.
     # Using indices (not XTC frame numbers) guarantees correct random-access
     # seeking even when the XTC stores non-contiguous or non-zero-based frame
     # numbers.
-    _start  = start  if start  is not None else 0
-    _stop   = stop   if stop   is not None else len(u.trajectory)
+    _start       = start if start is not None else 0
+    _stop        = stop  if stop  is not None else len(u.trajectory)
     traj_indices = list(range(_start, _stop, stride))
     n_frames     = len(traj_indices)
- 
-    # Initialise segment groups once — workers create their own copies.
-    segs, _        = _grp_init(u, ref_atom=ref, step=castep)
-    ca_per_segment = len(u.segments[0].atoms.select_atoms(f"name {ref}"))
- 
-    typer.echo(f"[i] Segments      : {len(segs)}")
-    typer.echo(f"[i] {ref} / segment  : {ca_per_segment}")
-    typer.echo(f"[i] Frames        : {n_frames}")
-    typer.echo(f"[i] Cutoff        : {rcut} Å")
-    typer.echo(f"[i] nproc         : {nproc}")
-    typer.echo(f"[i] Recenter      : {recenter}")
-    typer.echo(f"[i] Density       : {density}")
- 
+
+    # Initialise segment groups once from the selected segments.
+    # sel_indices is returned unchanged (or resolved if it was None), and is
+    # passed to workers so they can build their own identical groups.
+    segs, _, sel_indices = _grp_init(u, ref_atom=ref, step=castep,
+                                     sel_indices=sel_indices)
+
+    # Use the first selected segment to count ref atoms per monomer.
+    # This ensures the count reflects the correct molecule type even when
+    # sel_indices does not start at universe segment 0.
+    ca_per_segment = len(
+        u.segments[sel_indices[0]].atoms.select_atoms(f"name {ref}")
+    )
+
+    typer.echo(f"[i] Segments (total)   : {len(u.segments)}")
+    typer.echo(f"[i] Segments (cluster) : {len(sel_indices)}  "
+               f"(indices {sel_indices[0]}-{sel_indices[-1]})")
+    typer.echo(f"[i] {ref} / segment       : {ca_per_segment}")
+    typer.echo(f"[i] Frames             : {n_frames}")
+    typer.echo(f"[i] Cutoff             : {rcut} Å")
+    typer.echo(f"[i] nproc              : {nproc}")
+    typer.echo(f"[i] Recenter           : {recenter}")
+    typer.echo(f"[i] Density            : {density}")
+
     # Initialise output accumulators before either branch so the common output
     # section below is always guaranteed to find them defined.
     stats_data:       list = []   # list of (frame_number, monomers, clusters, max_size)
     density_profiles: list = []   # list of (r_bins, conc) — unified format for both paths
- 
+
     # ------------------------------------------------------------------ #
     # Serial path  (nproc == 1)
     # ------------------------------------------------------------------ #
@@ -2149,32 +2269,42 @@ def cmd_aggr(
                 u.trajectory[abs_idx]
                 ts  = u.trajectory.ts
                 box = ts.dimensions.copy()
- 
+
                 if ts_idx % 10 == 0:
                     typer.echo(f"  Frame {ts_idx + 1}/{n_frames}  (traj frame {ts.frame})")
- 
+
                 # Reset group labels every frame — never carry state between frames.
                 grps_frame = np.arange(len(segs))
- 
+
                 for seg in segs:
                     seg.wrap()
- 
+
+                # ── Clustering: selected segments only ─────────────────────
+                # clusters contains lists of LOCAL indices (0…len(segs)-1).
                 clusters, monomer, n_clusters, max_size, _ = _find_clusters_and_stats(
                     segs, grps_frame, r_cutoff=rcut
                 )
- 
+
                 if ts_idx % 10 == 0:
                     typer.echo(
                         f"    monomers={monomer}  clusters={n_clusters}  largest={max_size}"
                     )
- 
+
                 if recenter:
-                    largest           = max(clusters, key=len)
-                    u.atoms.positions = _recenter_frame(u, largest, box)
+                    # Translate local cluster indices → universe-level segment
+                    # indices.  _recenter_frame / _unwrap_cluster both call
+                    # u.segments[seg_idx] directly and must receive universe
+                    # indices.  The functions themselves always move ALL atoms.
+                    largest_local = max(clusters, key=len)
+                    largest_univ  = [sel_indices[i] for i in largest_local]
+
+                    # ── Recentering: full universe ──────────────────────────
+                    u.atoms.positions = _recenter_frame(u, largest_univ, box)
                     writer.write(u.atoms)
- 
+
                     if density and ts_idx >= n_frames - n_frames_avg:
                         r_max = float(np.min(box[:3]) / 2.0)
+                        # ── Density: full universe ──────────────────────────
                         r_bins, conc = _radial_density(
                             u,
                             droplet_center=box[:3] / 2.0,
@@ -2184,13 +2314,13 @@ def cmd_aggr(
                             dr=dr,
                         )
                         density_profiles.append((r_bins, conc))
- 
+
                 stats_data.append((ts.frame, monomer, n_clusters, max_size))
- 
+
         finally:
             if writer is not None:
                 writer.close()
- 
+
     # ------------------------------------------------------------------ #
     # Parallel path  (nproc > 1)
     # ------------------------------------------------------------------ #
@@ -2203,43 +2333,44 @@ def cmd_aggr(
                              for i in range(0, n_frames, chunk_size)]
         # Global rank of each chunk's first frame among all analysed frames.
         chunk_start_ranks = [i * chunk_size for i in range(len(chunks))]
- 
+
         # tmp_paths is populated in chunk (== frame) order so that
         # _merge_trajectories can simply concatenate them sequentially.
         tmp_paths: list = []
         futures:   dict = {}
- 
+
         with ProcessPoolExecutor(max_workers=nproc) as pool:
             for chunk, start_rank in zip(chunks, chunk_start_ranks):
                 tmp = tempfile.mktemp(suffix=".xtc") if recenter else None
                 if tmp:
                     tmp_paths.append(tmp)
- 
+
                 fut = pool.submit(
                     _worker,
                     top, traj, chunk, ref, rcut, castep,
                     recenter, density, dr,
                     n_frames_avg, n_frames, start_rank, tmp,
+                    sel_indices,          # universe-level indices for clustering
                 )
                 futures[fut] = chunk
- 
+
             raw_stats:   list = []
             raw_density: list = []
- 
+
             for fut in as_completed(futures):
                 result = fut.result()
                 raw_stats.extend(result["stats_data"])
                 raw_density.extend(result["density_profiles"])
- 
+
         # Restore frame order — as_completed() returns in completion order,
         # not submission order.
         stats_data = sorted(raw_stats, key=lambda x: x[0])
- 
+
         # Merge per-worker XTC fragments in chunk order (== frame order).
         if recenter and tmp_paths:
             typer.echo(f"Merging {len(tmp_paths)} partial trajectories -> {outtraj}")
             _merge_trajectories(top, tmp_paths, outtraj)
- 
+
         # Rebuild density_profiles in the same (r_bins, conc) format as the
         # serial path so the common output section below handles both uniformly.
         if density and raw_density:
@@ -2249,7 +2380,7 @@ def cmd_aggr(
             density_profiles = [
                 (r_bins_first, c[:min_len]) for _, _, c in raw_density
             ]
- 
+
     # ------------------------------------------------------------------ #
     # Write outputs  (common to both serial and parallel paths)
     # ------------------------------------------------------------------ #
@@ -2258,7 +2389,7 @@ def cmd_aggr(
         fh.write("# Frame  Monomers  Clusters  LargestClusterSize\n")
         for frame, monomer, n_clusters, max_size in stats_data:
             fh.write(f"{frame}  {monomer}  {n_clusters}  {max_size}\n")
- 
+
     if density and density_profiles:
         # Truncate to the shortest profile before stacking.  r_max varies per
         # frame (it is clipped to half the box side), so array lengths can
@@ -2268,7 +2399,7 @@ def cmd_aggr(
         profiles_arr = np.array([c[:min_len] for _, c in density_profiles])
         avg_conc     = np.mean(profiles_arr, axis=0)
         std_conc     = np.std( profiles_arr, axis=0)
- 
+
         typer.echo(
             f"Writing radial density profile ({len(density_profiles)} frames) -> {profile}"
         )
@@ -2280,11 +2411,10 @@ def cmd_aggr(
             fh.write("# Radius(A)  Concentration(mM)  StdDev(mM)\n")
             for r, c, s in zip(r_bins_out, avg_conc, std_conc):
                 fh.write(f"{r:.3f}  {c:.6f}  {s:.6f}\n")
- 
+
     if recenter:
         typer.echo(f"Recentered trajectory -> {outtraj}")
     typer.echo("DONE!")
-
 
 # =============================================================================
 #  ░░  9.  Time-dependent S²  ░░
