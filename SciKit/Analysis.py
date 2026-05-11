@@ -1729,6 +1729,10 @@ def _load_universe(top: str, traj: Optional[str] = None):
 def _parse_segname(name: str) -> tuple:
     """Split a segment name into (prefix, number, zero-pad width).
 
+    The segment name must consist of an alphabetic prefix followed by a
+    numeric suffix.  Names beginning with digits, containing hyphens, or
+    with interleaved letters and digits (e.g. ``"H2O1"``) are not supported.
+
     Args:
         name (str): Segment name such as ``"R001"`` or ``"PRO099"``.
 
@@ -1751,29 +1755,80 @@ def _parse_segname(name: str) -> tuple:
     match = re.match(r'^([A-Za-z]+)(\d+)$', name)
     if not match:
         raise ValueError(
-            f"Segment name must be alphabetic prefix + numeric suffix, "
-            f"got: {name!r}"
+            f"Segment name must be alphabetic prefix + numeric suffix "
+            f"(e.g. 'R001', 'PRO099'), got: {name!r}"
         )
     prefix  = match.group(1)
     num_str = match.group(2)
     return prefix, int(num_str), len(num_str)
 
 
+def _expand_range(start_name: str, end_name: str) -> list:
+    """Expand a segment-name range into a list of segment name strings.
+
+    Both endpoints must share the same alphabetic prefix.  Zero-padding
+    width is taken from the **start** endpoint, which establishes the naming
+    convention for the entire range.
+
+    Args:
+        start_name (str): First segment name in the range (e.g. ``"R001"``).
+        end_name (str): Last segment name in the range (e.g. ``"R099"``).
+
+    Returns:
+        list[str]: Expanded segment names, inclusive of both endpoints.
+
+    Raises:
+        ValueError: If prefixes differ or start > end.
+
+    Examples::
+
+        _expand_range("R001", "R003")  # → ["R001", "R002", "R003"]
+        _expand_range("K01", "K10")    # → ["K01", "K02", …, "K10"]
+    """
+    start_prefix, start_num, start_width = _parse_segname(start_name)
+    end_prefix,   end_num,   end_width   = _parse_segname(end_name)
+
+    if start_prefix != end_prefix:
+        raise ValueError(
+            f"Range endpoints must share the same prefix: "
+            f"'{start_name}' (prefix='{start_prefix}') vs "
+            f"'{end_name}' (prefix='{end_prefix}')"
+        )
+
+    if start_num > end_num:
+        raise ValueError(
+            f"Range start > end: '{start_name}' > '{end_name}'"
+        )
+
+    # Use the start endpoint's width as the canonical zero-padding.
+    # If the end has more digits purely because the number is larger
+    # (e.g. R99 → R100), use the end width instead so all names are
+    # representable.
+    width = start_width if end_num < 10 ** start_width else end_width
+
+    return [f"{start_prefix}{num:0{width}d}" for num in range(start_num, end_num + 1)]
+
+
 def _parse_sel(sel: Optional[str], u) -> list:
     """Parse segment-name range string(s) into universe segment indices.
 
-    Supports single or comma-separated ranges of segment names.  Each range
-    endpoint must consist of an alphabetic prefix followed by a zero-padded
-    numeric suffix.  Both endpoints of a single range must share the same
-    prefix.
+    Supports:
+
+    - Single range: ``"R001-R099"``
+    - Comma-separated ranges: ``"R001-R099,K001-K010"``
+    - Single segment name: ``"R001"``
+    - Comma-separated mix: ``"R001-R099,K001,K005"``
+
+    Each range endpoint must consist of an alphabetic prefix followed by a
+    zero-padded numeric suffix.  Both endpoints of a single range must share
+    the same prefix.
 
     Segments in the specified range that do not exist in the universe are
     silently skipped (a warning is emitted if any are missing).
 
     Args:
         sel (Optional[str]): Segment-name range string, or ``None`` to select
-            all segments.  Examples: ``"R001-R099"``,
-            ``"R001-R099,K001-K010"``.
+            all segments.
         u (MDAnalysis.Universe): Loaded Universe (used to look up segids).
 
     Returns:
@@ -1787,6 +1842,7 @@ def _parse_sel(sel: Optional[str], u) -> list:
 
         _parse_sel("R001-R099", u)            # segments R001 … R099
         _parse_sel("R001-R099,K001-K010", u)  # two ranges combined
+        _parse_sel("R001", u)                 # single segment
         _parse_sel(None, u)                   # all segments
     """
     if sel is None:
@@ -1798,52 +1854,54 @@ def _parse_sel(sel: Optional[str], u) -> list:
         segid_to_idx[seg.segid] = i
 
     selected_indices: list = []
-    missing_count = 0
+    missing_names:    list = []
 
-    ranges = [r.strip() for r in sel.split(",")]
-    for rng in ranges:
-        if not rng:
+    tokens = [t.strip() for t in sel.split(",")]
+    for token in tokens:
+        if not token:
             continue
 
-        parts = rng.split("-")
-        if len(parts) != 2:
+        # Determine whether this token is a range (contains '-' between two
+        # valid segment names) or a single segment name.
+        # Strategy: try to split on '-' and validate both halves.  If the
+        # token contains no '-', or splitting gives != 2 parts, treat it as
+        # a single name.
+        parts = token.split("-")
+
+        if len(parts) == 2:
+            # Potential range — validate both parts
+            left  = parts[0].strip()
+            right = parts[1].strip()
+            try:
+                names = _expand_range(left, right)
+            except ValueError:
+                # Not a valid range — might be a single segment with '-' in
+                # topology (unusual).  Fall through to single-name handling.
+                # But since _parse_segname disallows '-', raise clearly.
+                raise
+        elif len(parts) == 1:
+            # Single segment name
+            _parse_segname(token)  # validate format; raises on failure
+            names = [token]
+        else:
+            # More than one '-' — ambiguous.  Require comma separation.
             raise ValueError(
-                f"Each range must be 'START-END' (e.g. 'R001-R099'), "
-                f"got: {rng!r}"
+                f"Ambiguous token '{token}': use comma-separated ranges "
+                f"(e.g. 'R001-R099,K001-K010'), not 'R001-R099-K001-K010'."
             )
 
-        start_name = parts[0].strip()
-        end_name   = parts[1].strip()
-
-        start_prefix, start_num, start_width = _parse_segname(start_name)
-        end_prefix,   end_num,   end_width   = _parse_segname(end_name)
-
-        if start_prefix != end_prefix:
-            raise ValueError(
-                f"Range endpoints must share the same prefix: "
-                f"'{start_name}' (prefix='{start_prefix}') vs "
-                f"'{end_name}' (prefix='{end_prefix}')"
-            )
-
-        if start_num > end_num:
-            raise ValueError(
-                f"Range start > end: '{start_name}' > '{end_name}'"
-            )
-
-        # Use the wider zero-padding of the two endpoints
-        width = max(start_width, end_width)
-
-        for num in range(start_num, end_num + 1):
-            segid = f"{start_prefix}{num:0{width}d}"
-            if segid in segid_to_idx:
-                selected_indices.append(segid_to_idx[segid])
+        for name in names:
+            if name in segid_to_idx:
+                selected_indices.append(segid_to_idx[name])
             else:
-                missing_count += 1
+                missing_names.append(name)
 
-    if missing_count > 0:
+    if missing_names:
+        n_missing = len(missing_names)
+        sample    = missing_names[:5]
         typer.echo(
-            f"[w] {missing_count} segment name(s) in --sel '{sel}' "
-            f"not found in topology (skipped).",
+            f"[w] {n_missing} segment name(s) in --sel not found in topology "
+            f"(skipped). First few: {sample}",
             err=True,
         )
 
@@ -1899,8 +1957,8 @@ def _grp_init(u, ref_atom: str = "CA", step: int = 1,
         grps.append(i)
 
     if empty:
-        n_empty = len(empty)
-        sample  = empty[:5]
+        n_empty      = len(empty)
+        sample       = empty[:5]
         sample_names = [u.segments[idx].segid for idx in sample]
         raise ValueError(
             f"{n_empty} of the {len(sel_indices)} selected segment(s) contain no "
@@ -2281,12 +2339,13 @@ def cmd_aggr(
                       "--sel",
                       help=(
                           "Segment name range(s) for clustering, inclusive. "
-                          "Format: 'PREFIX_START-PREFIX_END' with optional "
-                          "comma-separated multiple ranges. "
-                          "Examples: 'R001-R099', 'R001-R099,K001-K010'. "
-                          "Only these segments contribute to aggregation "
-                          "statistics. Recentering and density profiles always "
-                          "use the full system. Default: all segments."
+                          "Each token is 'PREFIXSTART-PREFIXEND' or a single "
+                          "segment name. Multiple tokens are comma-separated. "
+                          "Examples: 'R001-R099', 'R001-R099,K001-K010', "
+                          "'R001'. Only matched segments contribute to "
+                          "aggregation statistics. Recentering and density "
+                          "profiles always use the full system. "
+                          "Default: all segments."
                       ),
                   )] = None,
 ):
@@ -2316,6 +2375,9 @@ def cmd_aggr(
         # Multiple segment types
         scical aggr --top conf.psf --traj system.xtc --rcut 8.0 \\
             --sel R001-R099,K001-K010
+
+        # Single segment
+        scical aggr --top conf.psf --traj system.xtc --rcut 8.0 --sel R001-R001
 
         # 8 workers — with PBC recentering and radial density
         scical aggr --top conf.psf --traj system.xtc --rcut 8.0 --sel R001-R099 \\
@@ -2541,6 +2603,7 @@ def cmd_aggr(
     if recenter:
         typer.echo(f"Recentered trajectory -> {outtraj}")
     typer.echo("DONE!")
+    
 
 # =============================================================================
 #  ░░  9.  Time-dependent S²  ░░
