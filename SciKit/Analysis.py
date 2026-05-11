@@ -1791,12 +1791,27 @@ def _grp_init(u, ref_atom: str = "CA", step: int = 1,
         sel_indices = list(range(len(u.segments)))
 
     segs, grps = [], []
+    empty: list = []                         # segment indices with no ref atoms
     for i, seg_idx in enumerate(sel_indices):
         segid = u.segments[seg_idx].segid
         cas   = u.select_atoms(f"segid {segid} and name {ref_atom}")
         seg   = cas[::step].atoms.select_atoms(f"name {ref_atom}")
+        if len(seg) == 0:
+            empty.append(seg_idx)
         segs.append(seg)
         grps.append(i)
+
+    if empty:
+        n_empty = len(empty)
+        sample  = empty[:5]
+        raise ValueError(
+            f"{n_empty} of the {len(sel_indices)} selected segment(s) contain no "
+            f"atoms named '{ref_atom}' (universe indices: {sample}"
+            f"{'…' if n_empty > 5 else ''}).\n"
+            f"  • Check --ref (current: '{ref_atom}'). For proteins use 'CA'; "
+            f"for nucleic acids / lipids use 'P'.\n"
+            f"  • Check --sel: the selected range may include the wrong molecule type."
+        )
 
     return segs, np.array(grps), sel_indices
 
@@ -2232,14 +2247,17 @@ def cmd_aggr(
     n_frames     = len(traj_indices)
 
     # Initialise segment groups once from the selected segments.
-    # sel_indices is returned unchanged (or resolved if it was None), and is
-    # passed to workers so they can build their own identical groups.
-    segs, _, sel_indices = _grp_init(u, ref_atom=ref, step=castep,
-                                     sel_indices=sel_indices)
+    # _grp_init raises ValueError if any selected segment has no ref atoms,
+    # which means --ref or --sel is wrong; surface that as a clean message.
+    try:
+        segs, _, sel_indices = _grp_init(u, ref_atom=ref, step=castep,
+                                         sel_indices=sel_indices)
+    except ValueError as exc:
+        typer.echo(f"[!] {exc}", err=True)
+        raise typer.Exit(1)
 
-    # Use the first selected segment to count ref atoms per monomer.
-    # This ensures the count reflects the correct molecule type even when
-    # sel_indices does not start at universe segment 0.
+    # ca_per_segment: count ref atoms on the first selected segment.
+    # _grp_init already guaranteed this is > 0, so no further guard needed.
     ca_per_segment = len(
         u.segments[sel_indices[0]].atoms.select_atoms(f"name {ref}")
     )
