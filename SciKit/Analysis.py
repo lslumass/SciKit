@@ -303,6 +303,78 @@ def cmd_msd(
 #  ░░  2.  Rg  ░░
 # =============================================================================
 
+def _parse_seg_selection(sel_str: str, available_segids: list[str]) -> list[str]:
+    """Parse a segment selection string into a list of segment IDs.
+
+    Supports:
+        - Single segment: ``"R001"``
+        - Range of segments: ``"R001-R010"`` (matches numeric suffix)
+        - Comma-separated mix: ``"R001,R003-R006,R010"``
+
+    Args:
+        sel_str (str): Segment selection expression.
+        available_segids (list[str]): All segment IDs present in the system.
+
+    Returns:
+        list[str]: Filtered list of matching segment IDs, preserving the order
+        they appear in *available_segids*.
+
+    Raises:
+        typer.Exit: If the range expression cannot be parsed or prefixes
+        do not match.
+    """
+    import re
+
+    selected = set()
+
+    for token in sel_str.split(","):
+        token = token.strip()
+        if "-" in token and token.count("-") == 1:
+            # Range: e.g. "R001-R010"
+            start_seg, end_seg = token.split("-")
+            start_seg, end_seg = start_seg.strip(), end_seg.strip()
+
+            # Extract prefix and numeric parts
+            m_start = re.match(r"^([A-Za-z]*)(\d+)$", start_seg)
+            m_end   = re.match(r"^([A-Za-z]*)(\d+)$", end_seg)
+
+            if not m_start or not m_end:
+                typer.echo(f"[!] Cannot parse range: '{token}'", err=True)
+                raise typer.Exit(1)
+
+            prefix_s, num_s = m_start.group(1), int(m_start.group(2))
+            prefix_e, num_e = m_end.group(1),   int(m_end.group(2))
+
+            if prefix_s != prefix_e:
+                typer.echo(
+                    f"[!] Mismatched prefixes in range: '{prefix_s}' vs '{prefix_e}'",
+                    err=True,
+                )
+                raise typer.Exit(1)
+
+            if num_s > num_e:
+                typer.echo(
+                    f"[!] Invalid range: start ({num_s}) > end ({num_e})",
+                    err=True,
+                )
+                raise typer.Exit(1)
+
+            # Match available segids that fall within the numeric range
+            for segid in available_segids:
+                m = re.match(r"^([A-Za-z]*)(\d+)$", segid)
+                if m and m.group(1) == prefix_s:
+                    num = int(m.group(2))
+                    if num_s <= num <= num_e:
+                        selected.add(segid)
+        else:
+            # Single segment
+            selected.add(token)
+
+    # Preserve original ordering from available_segids
+    filtered = [s for s in available_segids if s in selected]
+    return filtered
+
+
 def _rg_worker(args: tuple):
     """Subprocess worker: compute radius-of-gyration time series for one segment.
 
@@ -353,6 +425,7 @@ def _rg_worker(args: tuple):
 def cmd_rg(
     top: Annotated[str, typer.Option("--top")] = "conf.psf",
     traj: Annotated[str, typer.Option("--traj")] = "system.xtc",
+    sel: Annotated[Optional[str], typer.Option("--sel", help="Segment selection (e.g. R001, R001-R010, or R001,R003-R006)")] = None,
     resid: Annotated[Optional[str], typer.Option("--resid", help="Residue range")] = None,
     out: Annotated[str, typer.Option("--out", help="Output file")] = "rg.dat",
     start: Annotated[int, typer.Option("--start")] = 0,
@@ -369,6 +442,10 @@ def cmd_rg(
     Args:
         top (str): Path to the topology file.
         traj (str): Path to the trajectory file.
+        sel (Optional[str]): Segment selection expression. Accepts a single
+            segment (``"R001"``), a range (``"R001-R010"``), or a
+            comma-separated combination (``"R001,R003-R006,R010"``).
+            Omit to use all segments.
         resid (Optional[str]): Residue range to restrict the selection
             (e.g. ``"1:100"``).  Omit to use the full protein.
         out (str): Path for the output ``.dat`` file.
@@ -383,7 +460,7 @@ def cmd_rg(
 
     Example::
 
-            scical rg --top conf.psf --traj system.xtc --out rg.dat --stride 5 --nproc 4
+            scical rg --top conf.psf --traj system.xtc --sel R001-R010 --out rg.dat --stride 5 --nproc 4
     """
     import MDAnalysis as mda
 
@@ -399,6 +476,14 @@ def cmd_rg(
         raise typer.Exit(1)
 
     segids = [seg.segid for seg in segments]
+
+    # --- Apply --sel filter ---
+    if sel:
+        segids = _parse_seg_selection(sel, segids)
+        if not segids:
+            typer.echo(f"[!] No segments match selection: '{sel}'", err=True)
+            raise typer.Exit(1)
+
     typer.echo(f"[i] Segments : {segids}")
     typer.echo(f"[i] Region   : {'resid ' + resid if resid else 'all'}")
 
