@@ -78,6 +78,8 @@ import typer
 from scipy.spatial import cKDTree
 from typing_extensions import Annotated
 
+
+warmings.filterwarnings("ignore")
 # ─────────────────────────────────────────────────────────────────────────────
 #  Typer application
 # ─────────────────────────────────────────────────────────────────────────────
