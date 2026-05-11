@@ -1697,6 +1697,8 @@ def cmd_contacts(
 #  ░░  8.  Aggregation / Clustering / Density  ░░
 # =============================================================================
 
+import re
+
 AVOGADRO = 6.022e23
 """float: Avogadro's number (mol⁻¹), used for concentration unit conversion."""
 
@@ -1720,44 +1722,139 @@ def _load_universe(top: str, traj: Optional[str] = None):
     return mda.Universe(top, traj) if traj else mda.Universe(top)
 
 
-def _parse_sel(sel: Optional[str], n_segs: int) -> list:
-    """Parse a segment-range string into a list of universe segment indices.
+# ---------------------------------------------------------------------------
+#  Segment-name parsing
+# ---------------------------------------------------------------------------
+
+def _parse_segname(name: str) -> tuple:
+    """Split a segment name into (prefix, number, zero-pad width).
 
     Args:
-        sel (Optional[str]): Inclusive range string such as ``"0-99"``, or
-            ``None`` to select all segments.
-        n_segs (int): Total number of segments in the Universe.
+        name (str): Segment name such as ``"R001"`` or ``"PRO099"``.
+
+    Returns:
+        tuple[str, int, int]:
+
+        - **prefix** — Alphabetic prefix (e.g. ``"R"``).
+        - **number** — Integer value of the numeric suffix.
+        - **width** — Character width of the numeric suffix (for zero-padding).
+
+    Raises:
+        ValueError: If *name* does not match the expected pattern.
+
+    Examples::
+
+        _parse_segname("R001")    # → ("R", 1, 3)
+        _parse_segname("PRO099")  # → ("PRO", 99, 3)
+        _parse_segname("K10")     # → ("K", 10, 2)
+    """
+    match = re.match(r'^([A-Za-z]+)(\d+)$', name)
+    if not match:
+        raise ValueError(
+            f"Segment name must be alphabetic prefix + numeric suffix, "
+            f"got: {name!r}"
+        )
+    prefix  = match.group(1)
+    num_str = match.group(2)
+    return prefix, int(num_str), len(num_str)
+
+
+def _parse_sel(sel: Optional[str], u) -> list:
+    """Parse segment-name range string(s) into universe segment indices.
+
+    Supports single or comma-separated ranges of segment names.  Each range
+    endpoint must consist of an alphabetic prefix followed by a zero-padded
+    numeric suffix.  Both endpoints of a single range must share the same
+    prefix.
+
+    Segments in the specified range that do not exist in the universe are
+    silently skipped (a warning is emitted if any are missing).
+
+    Args:
+        sel (Optional[str]): Segment-name range string, or ``None`` to select
+            all segments.  Examples: ``"R001-R099"``,
+            ``"R001-R099,K001-K010"``.
+        u (MDAnalysis.Universe): Loaded Universe (used to look up segids).
 
     Returns:
         list[int]: Sorted list of zero-based universe segment indices.
 
     Raises:
-        ValueError: If *sel* is malformed or the indices are out of range.
+        ValueError: If *sel* is malformed, prefixes mismatch within a range,
+            or no segments match.
 
     Examples::
 
-        _parse_sel("0-99",   200)  # → [0, 1, …, 99]
-        _parse_sel("50-149", 200)  # → [50, 51, …, 149]
-        _parse_sel(None,     200)  # → [0, 1, …, 199]
+        _parse_sel("R001-R099", u)            # segments R001 … R099
+        _parse_sel("R001-R099,K001-K010", u)  # two ranges combined
+        _parse_sel(None, u)                   # all segments
     """
     if sel is None:
-        return list(range(n_segs))
+        return list(range(len(u.segments)))
 
-    try:
-        lo_str, hi_str = sel.split("-")
-        lo, hi = int(lo_str), int(hi_str)
-    except ValueError:
-        raise ValueError(
-            f"--sel must be 'START-STOP' (e.g. '0-99'), got: {sel!r}"
+    # Build lookup: segid → universe segment index
+    segid_to_idx: dict = {}
+    for i, seg in enumerate(u.segments):
+        segid_to_idx[seg.segid] = i
+
+    selected_indices: list = []
+    missing_count = 0
+
+    ranges = [r.strip() for r in sel.split(",")]
+    for rng in ranges:
+        if not rng:
+            continue
+
+        parts = rng.split("-")
+        if len(parts) != 2:
+            raise ValueError(
+                f"Each range must be 'START-END' (e.g. 'R001-R099'), "
+                f"got: {rng!r}"
+            )
+
+        start_name = parts[0].strip()
+        end_name   = parts[1].strip()
+
+        start_prefix, start_num, start_width = _parse_segname(start_name)
+        end_prefix,   end_num,   end_width   = _parse_segname(end_name)
+
+        if start_prefix != end_prefix:
+            raise ValueError(
+                f"Range endpoints must share the same prefix: "
+                f"'{start_name}' (prefix='{start_prefix}') vs "
+                f"'{end_name}' (prefix='{end_prefix}')"
+            )
+
+        if start_num > end_num:
+            raise ValueError(
+                f"Range start > end: '{start_name}' > '{end_name}'"
+            )
+
+        # Use the wider zero-padding of the two endpoints
+        width = max(start_width, end_width)
+
+        for num in range(start_num, end_num + 1):
+            segid = f"{start_prefix}{num:0{width}d}"
+            if segid in segid_to_idx:
+                selected_indices.append(segid_to_idx[segid])
+            else:
+                missing_count += 1
+
+    if missing_count > 0:
+        typer.echo(
+            f"[w] {missing_count} segment name(s) in --sel '{sel}' "
+            f"not found in topology (skipped).",
+            err=True,
         )
 
-    if lo < 0 or hi >= n_segs or lo > hi:
+    if not selected_indices:
+        available = sorted(segid_to_idx.keys())[:10]
         raise ValueError(
-            f"--sel '{sel}' is out of range for a universe with {n_segs} segments "
-            f"(valid range: 0-{n_segs - 1})."
+            f"No segments matched --sel '{sel}'. "
+            f"Available segids (first 10): {available}"
         )
 
-    return list(range(lo, hi + 1))
+    return sorted(set(selected_indices))
 
 
 def _grp_init(u, ref_atom: str = "CA", step: int = 1,
@@ -1804,9 +1901,10 @@ def _grp_init(u, ref_atom: str = "CA", step: int = 1,
     if empty:
         n_empty = len(empty)
         sample  = empty[:5]
+        sample_names = [u.segments[idx].segid for idx in sample]
         raise ValueError(
             f"{n_empty} of the {len(sel_indices)} selected segment(s) contain no "
-            f"atoms named '{ref_atom}' (universe indices: {sample}"
+            f"atoms named '{ref_atom}' (segids: {sample_names}"
             f"{'…' if n_empty > 5 else ''}).\n"
             f"  • Check --ref (current: '{ref_atom}'). For proteins use 'CA'; "
             f"for nucleic acids / lipids use 'P'.\n"
@@ -2182,11 +2280,13 @@ def cmd_aggr(
     sel:          Annotated[Optional[str], typer.Option(
                       "--sel",
                       help=(
-                          "Segment index range for clustering, inclusive "
-                          "(e.g. '0-99'). Only these segments contribute to "
-                          "aggregation statistics. Recentering and density "
-                          "profiles always use the full system. "
-                          "Default: all segments."
+                          "Segment name range(s) for clustering, inclusive. "
+                          "Format: 'PREFIX_START-PREFIX_END' with optional "
+                          "comma-separated multiple ranges. "
+                          "Examples: 'R001-R099', 'R001-R099,K001-K010'. "
+                          "Only these segments contribute to aggregation "
+                          "statistics. Recentering and density profiles always "
+                          "use the full system. Default: all segments."
                       ),
                   )] = None,
 ):
@@ -2210,11 +2310,15 @@ def cmd_aggr(
 
     Example::
 
-        # Serial — cluster statistics only, proteins are segments 0-99
-        scical aggr --top conf.psf --traj system.xtc --rcut 8.0 --sel 0-99
+        # Serial — cluster statistics only, select by segment name
+        scical aggr --top conf.psf --traj system.xtc --rcut 8.0 --sel R001-R099
+
+        # Multiple segment types
+        scical aggr --top conf.psf --traj system.xtc --rcut 8.0 \\
+            --sel R001-R099,K001-K010
 
         # 8 workers — with PBC recentering and radial density
-        scical aggr --top conf.psf --traj system.xtc --rcut 8.0 --sel 0-99 \\
+        scical aggr --top conf.psf --traj system.xtc --rcut 8.0 --sel R001-R099 \\
             --recenter --density --dr 2.0 --n-frames-avg 100 --nproc 8
     """
     import MDAnalysis as mda
@@ -2232,7 +2336,7 @@ def cmd_aggr(
     # All downstream code uses this list to restrict clustering; recentering
     # and density always operate on the full universe.
     try:
-        sel_indices = _parse_sel(sel, len(u.segments))
+        sel_indices = _parse_sel(sel, u)
     except ValueError as exc:
         typer.echo(f"[!] {exc}", err=True)
         raise typer.Exit(1)
@@ -2262,9 +2366,13 @@ def cmd_aggr(
         u.segments[sel_indices[0]].atoms.select_atoms(f"name {ref}")
     )
 
+    # Display selected segids for clarity
+    first_segid = u.segments[sel_indices[0]].segid
+    last_segid  = u.segments[sel_indices[-1]].segid
+
     typer.echo(f"[i] Segments (total)   : {len(u.segments)}")
     typer.echo(f"[i] Segments (cluster) : {len(sel_indices)}  "
-               f"(indices {sel_indices[0]}-{sel_indices[-1]})")
+               f"({first_segid} … {last_segid})")
     typer.echo(f"[i] {ref} / segment       : {ca_per_segment}")
     typer.echo(f"[i] Frames             : {n_frames}")
     typer.echo(f"[i] Cutoff             : {rcut} Å")
