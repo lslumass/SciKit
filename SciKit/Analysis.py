@@ -3333,6 +3333,281 @@ def cmd_time_s2(
 
 
 # =============================================================================
+#  ░░  10.  Intra-chain Form Factor (Debye)  ░░
+# =============================================================================
+
+def _intracf_worker(args: tuple):
+    """Subprocess worker: compute intra-chain form factor W(q) over a frame chunk.
+
+    For each frame in the assigned chunk, evaluates the single-chain Debye
+    scattering formula for every selected segment:
+
+    .. math::
+
+        W(q) = \\frac{1}{N^2} \\sum_{i,j} \\frac{\\sin(q \\cdot r_{ij})}{q \\cdot r_{ij}}
+
+    where *N* is the number of reference atoms per segment and *r_ij* is the
+    pairwise distance (in nm) between atoms *i* and *j*.  The diagonal terms
+    (i == j) each contribute 1 (the limit of sin(x)/x as x→0).  The formula
+    exploits i↔j symmetry by computing only the upper triangle and doubling.
+
+    Args:
+        args (tuple): A packed argument tuple containing:
+
+            - **topology** (*str*) — Path to the topology file.
+            - **trajectory** (*str*) — Path to the trajectory file.
+            - **frame_indices** (*list[int]*) — Absolute frame indices to
+              process in this worker.
+            - **segids** (*list[str]*) — Segment identifiers to analyse.
+            - **ref_atom** (*str*) — Reference atom name for selection
+              (e.g. ``"CA"``).
+            - **qs** (*np.ndarray*) — Pre-computed q-value array (nm⁻¹),
+              passed directly from the main process to guarantee consistency.
+            - **worker_id** (*int*) — Worker index for logging.
+
+    Returns:
+        tuple[int, np.ndarray]: ``(n_frames_processed, Wq_sum)`` where
+        *Wq_sum* has shape ``(n_segments, n_q_bins)`` containing the
+        accumulated (un-averaged) W(q) over the processed frames.
+    """
+    _suppress_warnings()
+    import MDAnalysis as mda
+    from MDAnalysis.analysis import distances as mda_distances
+
+    # FIX 4: receive qs directly rather than recomputing from qmax/dq,
+    # eliminating the independent float-arithmetic recomputation.
+    (topology, trajectory, frame_indices, segids,
+     ref_atom, qs, worker_id) = args
+
+    u = mda.Universe(topology, trajectory)
+    bin_num = len(qs)
+
+    segs = []
+    for segid in segids:
+        seg = u.select_atoms(f"segid {segid} and name {ref_atom}")
+        segs.append(seg)
+
+    n_segs = len(segs)
+    Wq_sum = np.zeros((n_segs, bin_num), dtype=np.float64)
+
+    for frame_idx in frame_indices:
+        u.trajectory[frame_idx]
+        box = u.dimensions
+
+        for s_idx, seg in enumerate(segs):
+            # FIX 5: renamed nres -> n_atoms; this variable counts selected
+            # atoms (e.g. Cα), not necessarily one per residue.
+            n_atoms = len(seg)
+            if n_atoms < 2:
+                Wq_sum[s_idx] += 1.0
+                continue
+
+            dists = mda_distances.self_distance_array(seg.positions, box=box)
+            dists_nm = dists / 10.0  # Angstrom → nm
+
+            # FIX 6: vectorise over all pairs at once with np.outer instead
+            # of an O(N²) Python loop.  Shape: (bin_num, n_pairs).
+            qr = np.outer(qs, dists_nm)
+
+            # FIX 3: guard against rij == 0 (degenerate / overlapping atom
+            # positions).  The limit of sin(x)/x as x→0 is 1, but numpy
+            # produces NaN on 0/0 without this protection.
+            with np.errstate(invalid='ignore', divide='ignore'):
+                sinc_qr = np.where(qr == 0.0, 1.0, np.sin(qr) / qr)
+
+            # Sum over upper-triangle pairs, apply symmetry + diagonal,
+            # normalise by N² in a single step (FIX 7: clearer formula).
+            #   W(q) = (2 * Σ_{i<j} sinc(q·r_ij) + N) / N²
+            Wq_seg = (sinc_qr.sum(axis=1) * 2.0 + n_atoms) / (n_atoms ** 2)
+
+            Wq_sum[s_idx] += Wq_seg
+
+    typer.echo(f"  Worker {worker_id:02d}: {len(frame_indices)} frames processed")
+    return len(frame_indices), Wq_sum
+
+
+@app.command("intraCF")
+def cmd_intracf(
+    top: Annotated[str, typer.Option("--top", help="Topology file")] = "conf.psf",
+    traj: Annotated[str, typer.Option("--traj", help="Trajectory file")] = "system.xtc",
+    ref: Annotated[str, typer.Option(
+        "--ref", help="Reference atom name (e.g. CA, P)"
+    )] = "CA",
+    sel: Annotated[Optional[str], typer.Option(
+        "--sel",
+        help="Segment selection (e.g. R001, R001-R010, or R001,R003-R006). "
+             "Default: all segments."
+    )] = None,
+    out: Annotated[str, typer.Option("--out", help="Output file")] = "intraCF.dat",
+    qmax: Annotated[float, typer.Option(
+        "--qmax", help="Maximum q value (nm^-1)"
+    )] = 15.0,
+    dq: Annotated[float, typer.Option("--dq", help="q-spacing (nm^-1)")] = 0.02,
+    start: Annotated[int, typer.Option("--start", help="First frame index")] = 0,
+    stop: Annotated[int, typer.Option(
+        "--stop", help="Last frame index; -1=end"
+    )] = -1,
+    stride: Annotated[int, typer.Option("--stride", help="Frame stride")] = 100,
+    nproc: Annotated[int, typer.Option("--nproc", help="Parallel workers")] = 4,
+):
+    """Calculate per-segment **intra-chain form factor** W(q) via the Debye formula.
+
+    Computes the single-chain static structure factor (form factor) for every
+    segment (or a selected subset) in the topology.  The Debye scattering
+    equation is evaluated for a range of wavevectors q:
+
+    .. math::
+
+        W(q) = \\frac{1}{N^2} \\sum_{i,j} \\frac{\\sin(q \\cdot r_{ij})}{q \\cdot r_{ij}}
+
+    where *r_ij* is the pairwise distance in nm between reference atoms *i*
+    and *j* within the same chain.  The calculation accounts for periodic
+    boundary conditions via the simulation box dimensions.
+
+    If the system contains multiple chains (segments), each chain is computed
+    independently by default.  Use ``--sel`` to restrict to a subset of
+    segments.
+
+    Results are averaged over all analysed trajectory frames.
+
+    Args:
+        top (str): Path to the topology file (PSF, PDB, GRO, …).
+        traj (str): Path to the trajectory file (XTC, DCD, …).
+        ref (str): Reference atom name used for distance calculations
+            (e.g. ``"CA"`` for Cα atoms, ``"P"`` for phosphorus).
+        sel (Optional[str]): Segment selection expression.  Accepts a single
+            segment (``"R001"``), a range (``"R001-R010"``), or a
+            comma-separated combination (``"R001,R003-R006,R010"``).
+            Omit to compute all segments.
+        out (str): Output file path for the form factor table.
+        qmax (float): Maximum wavevector magnitude in nm⁻¹.
+        dq (float): Wavevector spacing in nm⁻¹.
+        start (int): Index of the first trajectory frame to include.
+        stop (int): Index of the last trajectory frame; ``-1`` means end.
+        stride (int): Step between analysed frames.
+        nproc (int): Number of parallel worker processes.
+
+    Output:
+        ``<out>`` — space-separated columns::
+
+            # q(nm^-1)  wq_<segid1>  wq_<segid2>  …
+
+        The first column is the wavevector q; subsequent columns are the
+        frame-averaged W(q) for each segment.
+
+    Example::
+
+            scical intraCF --top conf.psf --traj system.xtc --ref CA \\
+                           --qmax 15 --dq 0.02 --start 10000 --stride 100 \\
+                           --out intraCF.dat --nproc 8
+
+            scical intraCF --top conf.psf --traj system.xtc --ref CA \\
+                           --sel R001-R010 --out intraCF.dat --nproc 4
+    """
+    _suppress_warnings()
+    import MDAnalysis as mda
+
+    u = mda.Universe(top, traj)
+    n_total = len(u.trajectory)
+
+    # Resolve frame range
+    effective_stop = n_total if stop == -1 else min(stop, n_total)
+    frame_indices = list(range(start, effective_stop, stride))
+    n_frames = len(frame_indices)
+
+    if n_frames == 0:
+        typer.echo("[!] No frames selected.", err=True)
+        raise typer.Exit(1)
+
+    # Detect segments that contain matching reference atoms
+    segments = [
+        seg for seg in u.segments
+        if len(seg.atoms.select_atoms(f"name {ref}")) > 0
+    ]
+    if not segments:
+        typer.echo(f"[!] No segments contain atoms named '{ref}'.", err=True)
+        raise typer.Exit(1)
+
+    segids = [seg.segid for seg in segments]
+
+    # Apply --sel segment filter
+    if sel:
+        segids = _parse_seg_selection(sel, segids)
+        if not segids:
+            typer.echo(f"[!] No segments match selection: '{sel}'", err=True)
+            raise typer.Exit(1)
+
+    # FIX 1 + 2: build the q-grid once, in the main process, and pass it to
+    # workers directly (FIX 4).
+    #
+    # Original:  bin_num = int(qmax / dq)             ← truncates for non-
+    #            qs = np.linspace(dq, qmax, bin_num)    integer qmax/dq ratios;
+    #                                                    spacing ≠ dq exactly.
+    #
+    # Fix:       round() avoids silent truncation (e.g. int(0.9/0.1)=8 not 9).
+    #            Multiplying integer indices by dq gives exact uniform spacing.
+    bin_num = round(qmax / dq)
+    if bin_num < 1:
+        typer.echo(f"[!] q-grid is empty (qmax={qmax}, dq={dq}).", err=True)
+        raise typer.Exit(1)
+    qs = np.arange(1, bin_num + 1) * dq  # exact multiples of dq: dq, 2dq, …, qmax
+
+    typer.echo(f"[i] Topology    : {top}")
+    typer.echo(f"[i] Trajectory  : {traj}")
+    typer.echo(f"[i] Ref atom    : {ref}")
+    typer.echo(f"[i] Segments    : {len(segids)}")
+    typer.echo(f"[i] Frames      : {n_frames}  "
+               f"(start={start} stop={effective_stop} stride={stride})")
+    typer.echo(f"[i] q range     : {qs[0]:.4f} - {qs[-1]:.4f} nm^-1  ({bin_num} bins)")
+    typer.echo(f"[i] Workers     : {nproc}")
+    typer.echo(f"[i] Output      : {out}")
+    del u
+
+    # Partition frames across workers
+    n_workers = min(nproc, n_frames)
+    chunks = [frame_indices[i::n_workers] for i in range(n_workers)]
+
+    # FIX 4: pass qs array directly so workers never recompute it
+    work_args = [
+        (top, traj, chunk, segids, ref, qs, wid)
+        for wid, chunk in enumerate(chunks)
+    ]
+
+    # Dispatch parallel workers
+    with Pool(n_workers) as pool:
+        results = pool.map(_intracf_worker, work_args)
+
+    # Accumulate results
+    n_segs = len(segids)
+    Wq_total = np.zeros((n_segs, bin_num), dtype=np.float64)
+    total_frames = 0
+    for n_proc_frames, Wq_partial in results:
+        Wq_total += Wq_partial
+        total_frames += n_proc_frames
+
+    # Average over frames
+    Wq_avg = Wq_total / total_frames
+
+    # Write output
+    W = 16
+    header = " ".join(
+        [f"{'q(nm^-1)':>{W - 2}}"] + [f"{'wq_' + s:>{W}}" for s in segids]
+    )
+
+    data = np.column_stack([qs, Wq_avg.T])
+    np.savetxt(
+        out, data,
+        header=header,
+        fmt=[f"%{W}.6f"] * (1 + n_segs),
+    )
+
+    typer.echo(f"[+] Intra-chain form factor saved -> {out}  "
+               f"({n_segs} segments, {bin_num} q-bins, "
+               f"{total_frames} frames averaged)")
+
+
+               
+# =============================================================================
 #  ░░  Entry-point  ░░
 # =============================================================================
 
