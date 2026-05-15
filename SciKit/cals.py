@@ -104,13 +104,15 @@ def intraCF2nu(q, Wq, qmax=1.65):
     
     limit = next(i for i, q_val in enumerate(q) if q_val > qmax)
     slopes = []
+    qs = []
     for i in range(limit):
         xs, ys = q[i, i+55], Wq[i, i+55]
         popt, _ = curve_fit(fit_func, xs, ys, p0=[-2, -0.5])
         a, b = popt
         slopes.append(a)
+        qs.append(q[i])
     
     slope_min = min(slopes[:limit])
     nu = -1/slope_min
-    return nu
+    return {"nu": nu, "slopes": slopes, "qs": qs}
         
