@@ -107,14 +107,35 @@ def intraCF2nu(q, Wq, qmax=1.65, window=55):
 
     slopes = []
     qs = []
+    chi_squareds = []
+
     for i in range(limit):
         if i + window > len(q):
             break
         xs, ys = q[i:i+window], Wq[i:i+window]
-        popt, _ = curve_fit(fit_func, xs, ys, p0=[-2, -0.5])
+        popt, pcov = curve_fit(fit_func, xs, ys, p0=[-2, -0.5])
+
+        # Compute residuals and reduced chi-squared
+        y_fit = fit_func(xs, *popt)
+        residuals = ys - y_fit
+        chi_sq = np.sum((residuals ** 2) / y_fit)       # chi-squared
+        dof = len(xs) - len(popt)                        # degrees of freedom
+        chi_sq_red = chi_sq / dof                        # reduced chi-squared
+
         slopes.append(popt[0])
         qs.append(q[i])
+        chi_squareds.append(chi_sq_red)
+
+        print(f"Window {i:4d} | q_start = {q[i]:.4f} | "
+              f"slope = {popt[0]:.4f} | χ²_red = {chi_sq_red:.6e}")
 
     slope_min = min(slopes)
+    best_idx = slopes.index(slope_min)
     nu = -1.0 / slope_min
-    return {"nu": nu, "slopes": slopes, "qs": qs}
+
+    return {
+        "nu": nu,
+        "slopes": slopes,
+        "qs": qs,
+        "chi2": chi_squareds
+    }
