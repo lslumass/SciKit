@@ -3360,7 +3360,7 @@ def _intracf_worker(args: tuple):
               process in this worker.
             - **segids** (*list[str]*) — Segment identifiers to analyse.
             - **ref_atom** (*str*) — Reference atom name for selection
-              (e.g. ``"CA"``).
+              (e.g. ``"CA"``), or ``"all"`` for all atoms.
             - **qs** (*np.ndarray*) — Pre-computed q-value array (nm⁻¹),
               passed directly from the main process to guarantee consistency.
             - **worker_id** (*int*) — Worker index for logging.
@@ -3384,7 +3384,10 @@ def _intracf_worker(args: tuple):
 
     segs = []
     for segid in segids:
-        seg = u.select_atoms(f"segid {segid} and name {ref_atom}")
+        if ref_atom == "all":
+            seg = u.select_atoms(f"segid {segid}")
+        else:
+            seg = u.select_atoms(f"segid {segid} and name {ref_atom}")
         segs.append(seg)
 
     n_segs = len(segs)
@@ -3431,8 +3434,8 @@ def cmd_intracf(
     top: Annotated[str, typer.Option("--top", help="Topology file")] = "conf.psf",
     traj: Annotated[str, typer.Option("--traj", help="Trajectory file")] = "system.xtc",
     ref: Annotated[str, typer.Option(
-        "--ref", help="Reference atom name (e.g. CA, P)"
-    )] = "CA",
+        "--ref", help="Reference atom name (e.g. CA, P). Default: all atoms."
+    )] = "all",
     sel: Annotated[Optional[str], typer.Option(
         "--sel",
         help="Segment selection (e.g. R001, R001-R010, or R001,R003-R006). "
@@ -3475,6 +3478,7 @@ def cmd_intracf(
         traj (str): Path to the trajectory file (XTC, DCD, …).
         ref (str): Reference atom name used for distance calculations
             (e.g. ``"CA"`` for Cα atoms, ``"P"`` for phosphorus).
+            Use ``"all"`` (default) to include every atom in each segment.
         sel (Optional[str]): Segment selection expression.  Accepts a single
             segment (``"R001"``), a range (``"R001-R010"``), or a
             comma-separated combination (``"R001,R003-R006,R010"``).
@@ -3501,7 +3505,7 @@ def cmd_intracf(
                            --qmax 15 --dq 0.02 --start 10000 --stride 100 \\
                            --out intraCF.dat --nproc 8
 
-            scical intraCF --top conf.psf --traj system.xtc --ref CA \\
+            scical intraCF --top conf.psf --traj system.xtc \\
                            --sel R001-R010 --out intraCF.dat --nproc 4
     """
     _suppress_warnings()
@@ -3520,12 +3524,19 @@ def cmd_intracf(
         raise typer.Exit(1)
 
     # Detect segments that contain matching reference atoms
-    segments = [
-        seg for seg in u.segments
-        if len(seg.atoms.select_atoms(f"name {ref}")) > 0
-    ]
+    if ref == "all":
+        segments = [seg for seg in u.segments if len(seg.atoms) > 0]
+    else:
+        segments = [
+            seg for seg in u.segments
+            if len(seg.atoms.select_atoms(f"name {ref}")) > 0
+        ]
+
     if not segments:
-        typer.echo(f"[!] No segments contain atoms named '{ref}'.", err=True)
+        if ref == "all":
+            typer.echo("[!] No non-empty segments found.", err=True)
+        else:
+            typer.echo(f"[!] No segments contain atoms named '{ref}'.", err=True)
         raise typer.Exit(1)
 
     segids = [seg.segid for seg in segments]
@@ -3537,15 +3548,6 @@ def cmd_intracf(
             typer.echo(f"[!] No segments match selection: '{sel}'", err=True)
             raise typer.Exit(1)
 
-    # FIX 1 + 2: build the q-grid once, in the main process, and pass it to
-    # workers directly (FIX 4).
-    #
-    # Original:  bin_num = int(qmax / dq)             ← truncates for non-
-    #            qs = np.linspace(dq, qmax, bin_num)    integer qmax/dq ratios;
-    #                                                    spacing ≠ dq exactly.
-    #
-    # Fix:       round() avoids silent truncation (e.g. int(0.9/0.1)=8 not 9).
-    #            Multiplying integer indices by dq gives exact uniform spacing.
     bin_num = round(qmax / dq)
     if bin_num < 1:
         typer.echo(f"[!] q-grid is empty (qmax={qmax}, dq={dq}).", err=True)
@@ -3554,7 +3556,7 @@ def cmd_intracf(
 
     typer.echo(f"[i] Topology    : {top}")
     typer.echo(f"[i] Trajectory  : {traj}")
-    typer.echo(f"[i] Ref atom    : {ref}")
+    typer.echo(f"[i] Ref atom    : {'all atoms' if ref == 'all' else ref}")
     typer.echo(f"[i] Segments    : {len(segids)}")
     typer.echo(f"[i] Frames      : {n_frames}  "
                f"(start={start} stop={effective_stop} stride={stride})")
