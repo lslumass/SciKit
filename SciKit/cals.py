@@ -97,19 +97,24 @@ def polymer_excluded_volume(q, Wq, qmin=0.0, qmax=np.inf, Rg_guess=10.0, nu_gues
 # =============================================================================
 
 def intraCF2nu(q, Wq, qmax=1.65, window=55):
+    results = polymer_excluded_volume(q, Wq, qmax=qmax)
+    Rg = results["Rg"]
+    qmin = 1.0 / Rg
+
     from scipy.optimize import curve_fit
 
     def fit_func(q, a, b):
         return np.power(10, a * np.log10(q) + b)
 
-    # Find index where q exceeds qmax
-    limit = next(i for i, q_val in enumerate(q) if q_val > qmax)
+    # Find index where q is qmin and qmax
+    lower = next(i for i, q_val in enumerate(q) if q_val >= qmin)
+    upper = next(i for i, q_val in enumerate(q) if q_val > qmax)
 
     slopes = []
     qs = []
     r_squareds = []
 
-    for i in range(limit):
+    for i in range(lower, upper):
         if i + window > len(q):
             break
         xs, ys = q[i:i+window], Wq[i:i+window]
