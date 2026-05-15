@@ -106,7 +106,7 @@ def intraCF2nu(q, Wq, qmax=1.65):
     slopes = []
     qs = []
     for i in range(limit):
-        xs, ys = q[i, i+55], Wq[i, i+55]
+        xs, ys = q[i:i+55], Wq[i:i+55]
         popt, _ = curve_fit(fit_func, xs, ys, p0=[-2, -0.5])
         a, b = popt
         slopes.append(a)
