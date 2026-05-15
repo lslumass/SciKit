@@ -83,7 +83,7 @@ def polymer_excluded_volume(q, Wq, qmin=0.0, qmax=np.inf, Rg_guess=10.0, nu_gues
     Wq_m = Wq[mask]
 
     # Fit the model to the data
-    popt, pcov = curve_fit(Pq, q_m, Wq_m, p0=[Rg_guess, nu_guess], bounds=([0, np.inf], [0.3, 1]), maxfev=maxfev)
+    popt, pcov = curve_fit(Pq, q_m, Wq_m, p0=[Rg_guess, nu_guess], bounds=([0, 0.3], [np.inf, 1]), maxfev=maxfev)
     Rg, nu = popt
     Rg_err, nu_err = np.sqrt(np.diag(pcov))
     Wq_fit = Pq(q_m, *popt)
