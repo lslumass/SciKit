@@ -125,22 +125,31 @@ def intraCF2nu(q, Wq, qmax=1.65, window=55):
         qs.append(q[i])
         r_squareds.append(r2)
 
-    # Find the first local maximum in R²
-    first_max_idx = None
+    # Method 1: First local maximum in R²
+    first_r2_max_idx = None
     for i in range(1, len(r_squareds) - 1):
         if r_squareds[i] > r_squareds[i-1] and r_squareds[i] > r_squareds[i+1]:
-            first_max_idx = i
+            first_r2_max_idx = i
             break
+    if first_r2_max_idx is None:
+        first_r2_max_idx = np.argmax(r_squareds)
 
-    # Fallback to global max if no local maximum found
-    if first_max_idx is None:
-        first_max_idx = np.argmax(r_squareds)
+    nu1 = -1.0 / slopes[first_r2_max_idx]
 
-    best_slope = slopes[first_max_idx]
-    nu = -1.0 / best_slope
+    # Method 2: First local minimum in slopes
+    first_slope_min_idx = None
+    for i in range(1, len(slopes) - 1):
+        if slopes[i] < slopes[i-1] and slopes[i] < slopes[i+1]:
+            first_slope_min_idx = i
+            break
+    if first_slope_min_idx is None:
+        first_slope_min_idx = np.argmin(slopes)
+
+    nu2 = -1.0 / slopes[first_slope_min_idx]
 
     return {
-        "nu": nu,
+        "nu1": nu1,
+        "nu2": nu2,
         "slopes": slopes,
         "qs": qs,
         "R2": r_squareds
