@@ -90,3 +90,27 @@ def polymer_excluded_volume(q, Wq, qmin=0.0, qmax=np.inf, Rg_guess=10.0, nu_gues
     chi2 = np.sum((Wq_m - Wq_fit) ** 2 / (len(Wq_m) - 2))
 
     return {"Rg": Rg, "nu":nu, "Rg_err": Rg_err, "nu_err": nu_err, "chi2": chi2, "q_fit": q_m, "Wq_fit": Wq_fit}
+
+
+# =============================================================================
+#  find the first linear region in Wq-q plot to get v
+# =============================================================================
+
+def intraCF2nu(q, Wq, qmax=1.65):
+    import scipy.optimize as curve_fit
+
+    def fit_func(q, a, b):
+        return np.power(10, a*np.log10(q) + b)
+    
+    limit = next(i for i, q_val in enumerate(q) if q_val > qmax)
+    slopes = []
+    for i in range(limit):
+        xs, ys = q[i, i+55], Wq[i, i+55]
+        popt, _ = curve_fit(fit_func, xs, ys, p0=[-2, -0.5])
+        a, b = popt
+        slopes.append(a)
+    
+    slope_min = min(slopes[:limit])
+    nu = -1/slope_min
+    return nu
+        
