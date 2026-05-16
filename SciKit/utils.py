@@ -633,3 +633,40 @@ def stack_jagged(arrays, model="min"):
         result = np.column_stack((result, arr))
 
     return result
+
+
+def mylinregress(xs, ys, xrange=None):
+    """
+    Perform linear regression on (x, y) data, optionally restricted to a specific x-range.
+
+    Parameters
+    ----------
+    xs : array-like
+        Independent variable values.
+    ys : array-like
+        Dependent variable values, same length as xs.
+    xrange : tuple of (float, float), optional
+        If provided, only data points with x in [xrange[0], xrange[1]] are plotted.
+    
+    Returns
+    -------
+    r_value : float
+        Correlation coefficient of the linear fit.
+    x_fit : np.ndarray
+        X values for the fitted line, either spanning the full range of xs or limited to xrange if provided.
+    y_fit : np.ndarray
+        Corresponding y values of the fitted line at x_fit.
+    """
+    from scipy.stats import linregress
+
+    xs = np.asarray(xs)
+    ys = np.asarray(ys)
+
+    slope, intercept, r_value, p_value, std_err = linregress(xs, ys)
+    if xrange:
+        x_fit = np.linspace(xrange[0], xrange[1], 200)
+        y_fit = slope * x_fit + intercept
+    else:
+        x_fit = np.linspace(xs.min()*0.9, xs.max()*1.1, 200)
+        y_fit = slope * x_fit + intercept
+    return r_value, x_fit, y_fit
