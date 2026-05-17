@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def general_temp(num_row, num_col, size_x, size_y, pad=3, *args, **kwargs):
+def general_temp(num_row, num_col, size_x, size_y, *args, **kwargs):
     """
     Create a standardized matplotlib figure with a grid of subplots.
 
@@ -50,7 +50,6 @@ def general_temp(num_row, num_col, size_x, size_y, pad=3, *args, **kwargs):
     >>> fig.savefig("output.png")
     """
     fig, axs = plt.subplots(num_row, num_col, figsize=(size_x, size_y), *args, **kwargs)
-    fig.tight_layout(pad=pad)
     if num_row*num_col != 1:
         axs = axs.ravel()
         for ax in axs:
