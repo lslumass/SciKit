@@ -3847,7 +3847,577 @@ def cmd_intracf(
                f"{total_frames} frames averaged)")
 
 
-               
+# =============================================================================
+#  ░░  RADIAL / SLAB NUMBER-DENSITY PROFILES (2D / 3D)  ░░
+# =============================================================================
+#
+#  Known limitation
+#  ----------------
+#  PBC minimum-image is applied to atom–origin *displacement* vectors.
+#  If the reference group itself straddles a periodic boundary, its
+#  center_of_mass() / center_of_geometry() may be incorrect.  Make the
+#  reference molecule whole (e.g. with MDAnalysis.transformations) before
+#  running this command in that case.
+#
+
+# Mapping from dimension label to coordinate axes indices
+_DIMEN_AXES = {
+    "xyz": [0, 1, 2],
+    "xy":  [0, 1],
+    "xz":  [0, 2],
+    "yz":  [1, 2],
+}
+
+# For 2D dimen: the single axis index NOT present in _DIMEN_AXES.
+# Used by --slab to identify which axis to profile along.
+_DIMEN_OMITTED = {
+    "xy": 2,   # omitted = Z
+    "xz": 1,   # omitted = Y
+    "yz": 0,   # omitted = X
+}
+
+
+def _density_worker(args: tuple):
+    """Subprocess worker: accumulate radial or slab density histograms.
+
+    Two modes controlled by the *slab* flag:
+
+    - ``slab=False``:  bins atoms by their 2D/3D radial distance from the
+      origin in the plane/space defined by *axes*.  PBC minimum-image
+      convention is applied on every selected axis before computing the
+      Euclidean distance.
+
+    - ``slab=True``:  bins atoms by their signed 1D displacement along
+      *omitted_axis* relative to the origin.  PBC minimum-image is applied
+      on that single axis.  Symmetric bins ``[-r_max, +r_max]`` are used.
+      The cross-section area of the box (product of the two in-plane box
+      lengths) is accumulated for correct volumetric normalisation.
+
+    Bin edges are computed with ``np.linspace`` (not ``np.arange``) so the
+    number of bins is always exactly ``int(round(...))`` regardless of
+    floating-point rounding in *dr*.
+
+    Args:
+        args (tuple): packed tuple of:
+
+            - **topology**     (*str*)            — topology file path
+            - **trajectory**   (*str*)            — trajectory file path
+            - **frame_indices** (*list[int]*)     — absolute frame indices
+            - **atom_names**   (*list[str]*)      — atom names to histogram
+            - **ref_segids**   (*Optional[list[str]]*) — segment IDs for
+              reference origin; ``None`` → box center
+            - **use_mass**     (*bool*)            — CoM vs CoG for origin
+            - **axes**         (*list[int]*)       — in-plane axis indices
+            - **dr**           (*float*)           — bin width (Å)
+            - **r_max**        (*float*)           — max radius / half-range (Å)
+            - **worker_id**    (*int*)             — index for logging
+            - **slab**         (*bool*)            — slab mode flag
+            - **omitted_axis** (*Optional[int]*)  — axis index for slab mode
+
+    Returns:
+        tuple[int, dict[str, np.ndarray], float]:
+            ``(n_frames_processed, counts_dict, area_sum)``
+
+            *area_sum* is the running sum of per-frame box cross-section
+            areas in Å² (non-zero only in slab mode).
+    """
+    _suppress_warnings()
+    import MDAnalysis as mda
+
+    (topology, trajectory, frame_indices, atom_names,
+     ref_segids, use_mass, axes, dr, r_max,
+     worker_id, slab, omitted_axis) = args
+
+    u = mda.Universe(topology, trajectory)
+
+    # ── Bin edges — must match cmd_density exactly ─────────────────────────
+    # Use n_bins*dr (not r_max) as the actual range so bin spacing is
+    # exactly dr regardless of floating-point rounding in r_max/dr.
+    if slab:
+        # Symmetric around origin: [-half, +half] with half = n_bins*dr/2
+        n_bins = int(round(2 * r_max / dr))
+        half   = n_bins * dr / 2
+        bins   = np.linspace(-half, half, n_bins + 1)
+    else:
+        n_bins    = int(round(r_max / dr))
+        rmax_eff  = n_bins * dr          # effective upper edge
+        bins      = np.linspace(0.0, rmax_eff, n_bins + 1)
+
+    # ── Atom selections ────────────────────────────────────────────────────
+    selections = {name: u.select_atoms(f"name {name}") for name in atom_names}
+
+    # ── Reference group ────────────────────────────────────────────────────
+    if ref_segids is not None:
+        ref_group = u.select_atoms("segid " + " ".join(ref_segids))
+        if len(ref_group) == 0:
+            raise ValueError(
+                f"No atoms found in reference segments: {ref_segids}"
+            )
+        use_ref = True
+    else:
+        ref_group = None
+        use_ref   = False
+
+    counts      = {name: np.zeros(n_bins, dtype=np.float64) for name in atom_names}
+    area_sum    = 0.0
+    n_processed = 0
+
+    for frame_idx in frame_indices:
+        u.trajectory[frame_idx]
+        box = u.dimensions  # shape (6,): [Lx, Ly, Lz, alpha, beta, gamma]
+
+        # ── Origin (3D coordinate) ─────────────────────────────────────────
+        if use_ref:
+            origin = (ref_group.center_of_mass() if use_mass
+                      else ref_group.center_of_geometry())
+        else:
+            if box is not None and box[0] > 0:
+                origin = box[:3] / 2.0
+            else:
+                raise ValueError(
+                    f"No --ref given and no valid box dimensions found at "
+                    f"frame {frame_idx}.  Cannot determine box center."
+                )
+
+        # ── Cross-section area for slab normalisation ──────────────────────
+        if slab:
+            if box is None or box[axes[0]] <= 0 or box[axes[1]] <= 0:
+                raise ValueError(
+                    f"Slab mode requires valid box lengths on both in-plane "
+                    f"axes at frame {frame_idx}."
+                )
+            area_sum += box[axes[0]] * box[axes[1]]
+
+        # ── Histogram each atom type ───────────────────────────────────────
+        for name in atom_names:
+            sel = selections[name]
+            if len(sel) == 0:
+                continue
+
+            if slab:
+                # 1D signed displacement along the omitted axis
+                values = sel.positions[:, omitted_axis] - origin[omitted_axis]
+                # PBC minimum image on the omitted axis
+                if box is not None and box[omitted_axis] > 0:
+                    L      = box[omitted_axis]
+                    values -= L * np.round(values / L)
+
+            else:
+                # 2D/3D displacement projected onto the selected axes
+                diff = sel.positions[:, axes] - origin[axes]
+                # PBC minimum image on each selected axis independently
+                if box is not None:
+                    box_axes = box[axes]          # lengths of the selected axes
+                    valid    = box_axes > 0        # guard against zero-length axes
+                    diff[:, valid] -= (
+                        box_axes[valid]
+                        * np.round(diff[:, valid] / box_axes[valid])
+                    )
+                values = np.linalg.norm(diff, axis=1)
+
+            hist, _ = np.histogram(values, bins=bins)
+            counts[name] += hist.astype(np.float64)
+
+        n_processed += 1
+
+    typer.echo(f"  Worker {worker_id:02d}: {n_processed} frames processed")
+    return n_processed, counts, area_sum
+
+
+@app.command("density")
+def cmd_density(
+    top: Annotated[str, typer.Option(
+        "--top", help="Topology file"
+    )] = "conf.psf",
+    traj: Annotated[str, typer.Option(
+        "--traj", help="Trajectory file"
+    )] = "system.xtc",
+    sel: Annotated[str, typer.Option(
+        "--sel",
+        help="Comma-separated atom names to profile (e.g. 'P,C,Mg'). "
+             "Case-sensitive: must match topology exactly.",
+    )] = "P",
+    ref: Annotated[Optional[str], typer.Option(
+        "--ref",
+        help="Segment name range(s) whose center defines the radial origin "
+             "(e.g. 'P001-P009', 'R001-R002,K001-K003'). "
+             "Omit to use the box center.",
+    )] = None,
+    dimen: Annotated[str, typer.Option(
+        "--dimen",
+        help=(
+            "'xyz' = 3D spherical shells (particles/Å³); "
+            "'xy'/'xz'/'yz' = 2D annular rings in that plane (particles/Å²), "
+            "or slab profile along the omitted axis when --slab is given."
+        ),
+    )] = "xyz",
+    slab: Annotated[bool, typer.Option(
+        "--slab/--no-slab",
+        help=(
+            "(2D --dimen only) Profile along the axis omitted from --dimen "
+            "instead of radially in the plane.  "
+            "  --dimen xy --slab  →  profile along Z  "
+            "  --dimen xz --slab  →  profile along Y  "
+            "  --dimen yz --slab  →  profile along X  "
+            "Bins run from -rmax to +rmax relative to the origin.  "
+            "Normalised by avg box cross-section area × dr → particles/Å³."
+        ),
+    )] = False,
+    out: Annotated[str, typer.Option(
+        "--out", help="Output file path"
+    )] = "density_profile.dat",
+    dr: Annotated[float, typer.Option(
+        "--dr", help="Bin width (Å)"
+    )] = 3.0,
+    r_max: Annotated[float, typer.Option(
+        "--rmax",
+        help="Max radius for radial mode, or half-range for slab mode (Å)",
+    )] = 200.0,
+    use_mass: Annotated[bool, typer.Option(
+        "--mass/--no-mass",
+        help=(
+            "Use center_of_mass() (--mass, default) or center_of_geometry() "
+            "(--no-mass) for the reference origin.  "
+            "Use --no-mass for coarse-grained systems without masses."
+        ),
+    )] = True,
+    start: Annotated[int, typer.Option(
+        "--start", help="First frame index (0-based)"
+    )] = 0,
+    stop: Annotated[int, typer.Option(
+        "--stop", help="Last frame index (exclusive); -1 = end of trajectory"
+    )] = -1,
+    stride: Annotated[int, typer.Option(
+        "--stride", help="Step between analysed frames"
+    )] = 1,
+    nproc: Annotated[int, typer.Option(
+        "--nproc", help="Number of parallel worker processes"
+    )] = 4,
+):
+    """Calculate radial or slab **number-density profiles** (2D or 3D).
+
+    **Modes**
+
+    - ``--dimen xyz``:
+      3D spherical radial density.
+      Normalised by spherical shell volume ``(4/3)π(r_out³−r_in³)``.
+      Units: particles/Å³.
+
+    - ``--dimen xy|xz|yz`` (no ``--slab``):
+      2D cylindrical radial density projected onto the chosen plane.
+      All atoms regardless of their position on the omitted axis are
+      projected.  Normalised by annular ring area ``π(r_out²−r_in²)``.
+      Units: particles/Å².
+
+    - ``--dimen xy|xz|yz --slab``:
+      1D slab density along the axis omitted from ``--dimen``.
+      Bins run from ``-rmax`` to ``+rmax`` relative to the origin.
+      Normalised by average box cross-section area × dr.
+      Units: particles/Å³.
+
+    **PBC**
+
+    Minimum-image convention is applied to atom–origin displacement vectors
+    in all modes.  If the reference group straddles a periodic boundary, make
+    it whole before analysis.
+
+    **Origin (--ref)**
+
+    - ``--ref`` given: center of mass/geometry of the specified segments.
+    - ``--ref`` omitted: geometric box center (requires valid box dimensions).
+
+    Args:
+        top (str): Topology file path.
+        traj (str): Trajectory file path.
+        sel (str): Comma-separated atom names (case-sensitive).
+        ref (Optional[str]): Segment range(s) for the radial origin.
+        dimen (str): Profile dimensionality: xyz, xy, xz, or yz.
+        slab (bool): Slab-density mode (2D dimen only).
+        out (str): Output file path.
+        dr (float): Bin width in Å.
+        r_max (float): Max radius / half-range in Å.
+        use_mass (bool): CoM (True) or CoG (False) for reference origin.
+        start (int): First frame index.
+        stop (int): Last frame index; -1 = end.
+        stride (int): Frame stride.
+        nproc (int): Parallel worker processes.
+
+    Output:
+        Space-separated columns written to ``<out>``::
+
+            # r(A)  density_P  density_C   ...   (radial modes)
+            # Z(A)  density_P  density_C   ...   (slab mode, --dimen xy)
+
+    Examples::
+
+        # 3D spherical profile around pore segments
+        scical density --top conf.psf --traj system.xtc \\
+            --sel P,C,Mg --ref P001-P009 --dimen xyz \\
+            --dr 3.0 --rmax 200 --out density_3d.dat --nproc 8
+
+        # 2D cylindrical profile in the XY plane
+        scical density --top conf.psf --traj system.xtc \\
+            --sel P,C --ref R001-R002 --dimen xy \\
+            --dr 2.0 --rmax 150 --out density_xy.dat --nproc 4
+
+        # Slab profile along Z (using --dimen xy --slab)
+        scical density --top conf.psf --traj system.xtc \\
+            --sel P,C --ref R001 --dimen xy --slab \\
+            --dr 2.0 --rmax 100 --out slab_z.dat --nproc 4
+    """
+    _suppress_warnings()
+    import MDAnalysis as mda
+
+    # ── Validate --dimen ───────────────────────────────────────────────────
+    dimen_lower = dimen.lower()
+    if dimen_lower not in _DIMEN_AXES:
+        typer.echo(
+            f"[!] Invalid --dimen '{dimen}'. "
+            f"Must be one of: xyz, xy, xz, yz.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    axes  = _DIMEN_AXES[dimen_lower]
+    is_3d = len(axes) == 3
+
+    # ── Guard: --slab is only meaningful for 2D dimen ──────────────────────
+    if slab and is_3d:
+        typer.echo(
+            "[!] --slab requires a 2D --dimen (xy, xz, or yz).  "
+            "For --dimen xyz there is no omitted axis.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    omitted_axis = _DIMEN_OMITTED.get(dimen_lower)  # None for xyz
+
+    # ── Parse atom names ───────────────────────────────────────────────────
+    atom_names = [n.strip() for n in sel.split(",") if n.strip()]
+    if not atom_names:
+        typer.echo("[!] No atom names specified in --sel.", err=True)
+        raise typer.Exit(1)
+
+    # ── Validate dr / r_max ────────────────────────────────────────────────
+    if dr <= 0:
+        typer.echo(f"[!] --dr must be positive, got {dr}.", err=True)
+        raise typer.Exit(1)
+    if r_max <= dr:
+        typer.echo(
+            f"[!] --rmax ({r_max}) must be greater than --dr ({dr}).",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    # ── Load universe ──────────────────────────────────────────────────────
+    u = mda.Universe(top, traj)
+    n_total = len(u.trajectory)
+
+    # ── Frame range ────────────────────────────────────────────────────────
+    effective_stop = n_total if stop == -1 else min(stop, n_total)
+    frame_indices  = list(range(start, effective_stop, stride))
+    n_frames       = len(frame_indices)
+    if n_frames == 0:
+        typer.echo("[!] No frames selected.", err=True)
+        raise typer.Exit(1)
+
+    # ── Resolve --ref ──────────────────────────────────────────────────────
+    ref_segids = None
+    if ref is not None:
+        try:
+            ref_seg_indices = _parse_sel(ref, u)
+        except ValueError as exc:
+            typer.echo(f"[!] {exc}", err=True)
+            raise typer.Exit(1)
+
+        ref_segids = [u.segments[i].segid for i in ref_seg_indices]
+        ref_group  = u.select_atoms("segid " + " ".join(ref_segids))
+        if len(ref_group) == 0:
+            typer.echo(
+                f"[!] No atoms found in reference segments: {ref_segids}",
+                err=True,
+            )
+            raise typer.Exit(1)
+
+        # Early validation: confirm origin computation works on frame 0
+        try:
+            _ = (ref_group.center_of_mass() if use_mass
+                 else ref_group.center_of_geometry())
+        except Exception as exc:
+            hint = (
+                "\n    Hint: use --no-mass for coarse-grained systems."
+                if use_mass else ""
+            )
+            typer.echo(
+                f"[!] {'center_of_mass' if use_mass else 'center_of_geometry'}"
+                f"() failed: {exc}{hint}",
+                err=True,
+            )
+            raise typer.Exit(1)
+
+        origin_method = "center_of_mass" if use_mass else "center_of_geometry"
+        typer.echo(
+            f"[i] Reference origin : {origin_method} of "
+            f"{len(ref_segids)} segment(s) "
+            f"({ref_segids[0]} ... {ref_segids[-1]}, "
+            f"{len(ref_group)} atoms)"
+        )
+    else:
+        typer.echo("[i] Reference origin : box center")
+        box = u.dimensions
+        if box is None or box[0] <= 0:
+            typer.echo(
+                "[!] No valid box dimensions found.  "
+                "Cannot use box center; please provide --ref.",
+                err=True,
+            )
+            raise typer.Exit(1)
+
+    # ── Warn if r_max exceeds half-box on the profiled axis (slab) ─────────
+    if slab:
+        box = u.dimensions
+        if box is not None and box[omitted_axis] > 0:
+            half_box = box[omitted_axis] / 2.0
+            if r_max > half_box:
+                typer.echo(
+                    f"[w] --rmax ({r_max} Å) > half box length on the omitted "
+                    f"axis ({half_box:.1f} Å) at frame 0.  "
+                    f"Bins beyond ±{half_box:.1f} Å will be empty after "
+                    f"minimum-image wrapping.",
+                )
+
+    # ── Validate atom selections ───────────────────────────────────────────
+    for name in atom_names:
+        n_atoms = len(u.select_atoms(f"name {name}"))
+        if n_atoms == 0:
+            typer.echo(
+                f"[!] No atoms found with name '{name}' "
+                f"(atom names are case-sensitive).",
+                err=True,
+            )
+            raise typer.Exit(1)
+        typer.echo(f"[i] Atom '{name}': {n_atoms} atoms")
+
+    # ── Mode / label setup ─────────────────────────────────────────────────
+    axis_names  = ["X", "Y", "Z"]
+    dimen_label = dimen_lower.upper()
+
+    if slab:
+        omitted_name = axis_names[omitted_axis]
+        mode_label   = f"slab along {omitted_name}-axis"
+        unit_label   = "particles/A^3"
+        bin_label    = f"{omitted_name}(A)"
+    elif is_3d:
+        mode_label   = "3D spherical shells"
+        unit_label   = "particles/A^3"
+        bin_label    = "r(A)"
+    else:
+        in_plane     = "".join(axis_names[ax] for ax in axes)
+        mode_label   = f"2D annular rings in {in_plane}-plane"
+        unit_label   = "particles/A^2"
+        bin_label    = "r(A)"
+
+    typer.echo(f"[i] Mode        : {mode_label}  ({unit_label})")
+    typer.echo(
+        f"[i] Frames      : {n_frames}  "
+        f"(start={start} stop={effective_stop} stride={stride})"
+    )
+    typer.echo(f"[i] dr          : {dr} A")
+    typer.echo(
+        f"[i] r_max       : {r_max} A"
+        + ("  (slab bins: -rmax … +rmax)" if slab else "")
+    )
+    typer.echo(f"[i] Workers     : {nproc}")
+    typer.echo(f"[i] Output      : {out}")
+    del u  # free before spawning workers
+
+    # ── Distribute frames across workers ───────────────────────────────────
+    n_workers = min(nproc, n_frames)
+    chunks    = [frame_indices[i::n_workers] for i in range(n_workers)]
+    work_args = [
+        (top, traj, chunk, atom_names, ref_segids, use_mass,
+         axes, dr, r_max, wid, slab, omitted_axis)
+        for wid, chunk in enumerate(chunks)
+    ]
+
+    if n_workers == 1:
+        results = [_density_worker(work_args[0])]
+    else:
+        with Pool(n_workers) as pool:
+            results = pool.map(_density_worker, work_args)
+
+    # ── Merge results from all workers ─────────────────────────────────────
+    # Bin edges computed with the same formula as in _density_worker.
+    if slab:
+        n_bins = int(round(2 * r_max / dr))
+        half   = n_bins * dr / 2
+        bins   = np.linspace(-half, half, n_bins + 1)
+    else:
+        n_bins   = int(round(r_max / dr))
+        rmax_eff = n_bins * dr
+        bins     = np.linspace(0.0, rmax_eff, n_bins + 1)
+
+    total_counts = {name: np.zeros(n_bins, dtype=np.float64)
+                    for name in atom_names}
+    total_frames = 0
+    total_area   = 0.0
+
+    for n_proc, counts, area_sum in results:
+        total_frames += n_proc
+        total_area   += area_sum
+        for name in atom_names:
+            total_counts[name] += counts[name]
+
+    # ── Normalise ──────────────────────────────────────────────────────────
+    r_inner  = bins[:-1]
+    r_outer  = bins[1:]
+    centres  = 0.5 * (r_inner + r_outer)
+
+    if slab:
+        # Each slab bin has the same volume: avg_cross_section_area × dr
+        avg_area   = total_area / total_frames
+        shell_norm = avg_area * dr          # scalar → broadcast over all bins
+        typer.echo(f"[i] Avg cross-section area: {avg_area:.2f} A^2")
+    elif is_3d:
+        # Spherical shell volume (A^3)
+        shell_norm = (4.0 / 3.0) * np.pi * (r_outer**3 - r_inner**3)
+    else:
+        # Annular ring area (A^2)
+        shell_norm = np.pi * (r_outer**2 - r_inner**2)
+
+    densities = {}
+    for name in atom_names:
+        avg_counts      = total_counts[name] / total_frames
+        densities[name] = avg_counts / shell_norm
+
+    # ── Write output ───────────────────────────────────────────────────────
+    W         = 16
+    meta_line = (
+        f"units: {unit_label} | mode: {mode_label} | "
+        f"dr={dr} A | r_max={r_max} A | frames={total_frames}"
+        + (f" | avg_area={avg_area:.2f} A^2" if slab else "")
+    )
+    col_header = " ".join(
+        [f"{bin_label:>{W - 2}}"] +
+        [f"{'density_' + name:>{W}}" for name in atom_names]
+    )
+    data = np.column_stack(
+        [centres] + [densities[name] for name in atom_names]
+    )
+    np.savetxt(
+        out, data,
+        header=meta_line + "\n" + col_header,
+        fmt=[f"%{W}.6f"] * (1 + len(atom_names)),
+    )
+
+    typer.echo(
+        f"\n[+] Density profile saved -> {out}  "
+        f"({len(atom_names)} atom type(s), {n_bins} bins, "
+        f"{total_frames} frames, {mode_label}, {unit_label})"
+    )
+
+    
+                   
 # =============================================================================
 #  ░░  Entry-point  ░░
 # =============================================================================
