@@ -68,6 +68,7 @@ def general_temp(num_row, num_col, size_x, size_y, *args, **kwargs):
     plt.rcParams['lines.linewidth'] = 2.0
     plt.rcParams['scatter.marker'] = 'o'
     plt.rcParams['lines.markersize'] = 6
+    plt.rcParams["savefig.dpi"] = 300
 
     return fig, axs
 
