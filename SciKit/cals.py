@@ -159,3 +159,20 @@ def intraCF2nu(q, Wq, qmax=1.65, window=55):
         "qs": qs,
         "R2": r_squareds
     }
+
+
+# =============================================================================
+#  fit the density distribution to "hyperbolic tangent function" to get the droplet radius
+#   J. S. Rowlinson and B. Widom , Molecular Theory of Capillarity , Oxford University, Oxford, 1982
+# =============================================================================
+
+def droplet(r, c):
+    def func(r, cin, cout, r0, d):
+        return (cin + cout) / 2 - (cin - cout) / 2 * np.tanh((r - r0) / d)
+    
+    from scipy.optimize import curve_fit
+    popt, pcov = curve_fit(func, r, c, p0=[np.max(c), np.min(c), np.mean(r), 1.0])
+    cin, cout, r0, d = popt
+    x_fit = np.linspace(r.min()*0.9, r.max()*1.1, 200)
+    y_fit = func(x_fit, *popt)
+    return {"in": cin, "out": cout, "r0": r0, "d": d, "x_fit": x_fit, "y_fit": y_fit}
