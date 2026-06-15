@@ -1441,22 +1441,55 @@ HEAVY_ATOMS = "name CA CB CC CD CE CF"
 def _parse_components(spec, segids):
     """Parse a component specification string into a mapping of label → segid list.
 
-    Segids are taken from *segids* in order and grouped according to the counts
-    in *spec*.  If *spec* is ``None``, all segids are placed in a single
-    component labelled ``"A"``.
+    Supports two modes determined by whether the value after ``:`` is an integer
+    (count mode) or a glob pattern (pattern mode).  If *spec* is ``None``, all
+    segids are placed in a single component labelled ``"A"``.
+
+    **Count mode** (original behaviour) — values after ``:`` are integers;
+    segids are consumed sequentially from *segids* in the order they appear::
+
+        "A:12 B:10"   # first 12 segids → A, next 10 → B
+
+    **Pattern mode** — values after ``:`` are ``fnmatch`` glob patterns matched
+    against *segids*; useful when copies of different components are interleaved
+    in the topology::
+
+        "A:PA* B:PB*"   # all segids matching PA* → A, all matching PB* → B
 
     Args:
-        spec (Optional[str]): Component spec, e.g. ``"A:100 B:100 C:100"``.
-        segids (list[str]): Ordered list of segids detected from the topology.
+        spec (Optional[str]): Component spec string, e.g. ``"A:12 B:10"`` or
+            ``"A:PA* B:PB*"``.  ``None`` places all segids into component ``"A"``.
+        segids (list[str]): Ordered list of unique segids detected from the topology.
 
     Returns:
         dict[str, list[str]]: Mapping ``{label: [segid, ...]}``.
 
     Raises:
-        ValueError: If the total count in *spec* does not match ``len(segids)``.
+        ValueError: In count mode, if the total count does not match ``len(segids)``.
+        ValueError: In pattern mode, if a pattern matches no segids, or if the
+            union of all patterns does not cover every segid exactly once.
     """
     if spec is None:
         return {"A": segids}
+
+    # Detect mode: pattern mode if any value after ':' is not a plain integer
+    if any(not t.split(":")[1].isdigit() for t in spec.split()):
+        import fnmatch
+        comp_map = {}
+        for token in spec.split():
+            label, pattern = token.split(":", 1)
+            matched = [s for s in segids if fnmatch.fnmatch(s, pattern)]
+            if not matched:
+                raise ValueError(f"Pattern '{pattern}' matched no segids.")
+            comp_map[label] = matched
+        assigned = sum(comp_map.values(), [])
+        if set(assigned) != set(segids):
+            raise ValueError(
+                f"Patterns do not cover all segids. Unassigned: {set(segids) - set(assigned)}"
+            )
+        return comp_map
+
+    # Count mode (original behaviour)
     comp_map = {}
     idx = 0
     for token in spec.split():
