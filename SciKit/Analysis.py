@@ -3403,6 +3403,8 @@ def _intracf_worker(args: tuple):
             - **segids** (*list[str]*) — Segment identifiers to analyse.
             - **ref_atom** (*str*) — Reference atom name for selection
               (e.g. ``"CA"``), or ``"all"`` for all atoms.
+            - **resid_range** (*Optional[str]*) — Residue range string
+              (e.g. ``"1:100"``), or ``None`` for all residues.
             - **qs** (*np.ndarray*) — Pre-computed q-value array (nm^-1),
               passed directly from the main process to guarantee consistency.
             - **dr** (*float*) — Histogram bin width in nm.  If 0, uses exact
@@ -3419,7 +3421,7 @@ def _intracf_worker(args: tuple):
     from MDAnalysis.analysis import distances as mda_distances
 
     (topology, trajectory, frame_indices, segids,
-     ref_atom, qs, dr, worker_id) = args
+     ref_atom, resid_range, qs, dr, worker_id) = args
 
     u = mda.Universe(topology, trajectory)
     bin_num = len(qs)
@@ -3428,10 +3430,12 @@ def _intracf_worker(args: tuple):
     segs = []
     for segid in segids:
         if ref_atom == "all":
-            seg = u.select_atoms(f"segid {segid}")
+            sel_str = (f"segid {segid} and resid {resid_range}"
+                       if resid_range else f"segid {segid}")
         else:
-            seg = u.select_atoms(f"segid {segid} and name {ref_atom}")
-        segs.append(seg)
+            sel_str = (f"segid {segid} and name {ref_atom} and resid {resid_range}"
+                       if resid_range else f"segid {segid} and name {ref_atom}")
+        segs.append(u.select_atoms(sel_str))
 
     n_segs = len(segs)
     Wq_sum = np.zeros((n_segs, bin_num), dtype=np.float64)
@@ -3523,6 +3527,8 @@ def _intracf_worker_gpu(args: tuple):
             - **segids** (*list[str]*) — Segment identifiers to analyse.
             - **ref_atom** (*str*) — Reference atom name for selection
               (e.g. ``"CA"``), or ``"all"`` for all atoms.
+            - **resid_range** (*Optional[str]*) — Residue range string
+              (e.g. ``"1:100"``), or ``None`` for all residues.
             - **qs** (*np.ndarray*) — Pre-computed q-value array (nm^-1).
             - **worker_id** (*int*) — Worker index for logging.
 
@@ -3544,7 +3550,7 @@ def _intracf_worker_gpu(args: tuple):
     import cupy as cp
 
     (topology, trajectory, frame_indices, segids,
-     ref_atom, qs, worker_id) = args
+     ref_atom, resid_range, qs, worker_id) = args
 
     u = mda.Universe(topology, trajectory)
     bin_num = len(qs)
@@ -3552,10 +3558,12 @@ def _intracf_worker_gpu(args: tuple):
     segs = []
     for segid in segids:
         if ref_atom == "all":
-            seg = u.select_atoms(f"segid {segid}")
+            sel_str = (f"segid {segid} and resid {resid_range}"
+                       if resid_range else f"segid {segid}")
         else:
-            seg = u.select_atoms(f"segid {segid} and name {ref_atom}")
-        segs.append(seg)
+            sel_str = (f"segid {segid} and name {ref_atom} and resid {resid_range}"
+                       if resid_range else f"segid {segid} and name {ref_atom}")
+        segs.append(u.select_atoms(sel_str))
 
     n_segs = len(segs)
     Wq_sum = np.zeros((n_segs, bin_num), dtype=np.float64)
@@ -3652,6 +3660,11 @@ def cmd_intracf(
         help="Segment selection (e.g. R001, R001-R010, or R001,R003-R006). "
              "Default: all segments."
     )] = None,
+    resid: Annotated[Optional[str], typer.Option(
+        "--resid",
+        help="Residue range to restrict the atom selection within each segment "
+             "(e.g. '1:100'). Default: all residues."
+    )] = None,
     out: Annotated[str, typer.Option("--out", help="Output file")] = "intraCF.dat",
     qmax: Annotated[float, typer.Option(
         "--qmax", help="Maximum q value (nm^-1)"
@@ -3714,6 +3727,8 @@ def cmd_intracf(
             segment (``"R001"``), a range (``"R001-R010"``), or a
             comma-separated combination (``"R001,R003-R006,R010"``).
             Omit to compute all segments.
+        resid (Optional[str]): Residue range to restrict the atom selection
+            within each segment (e.g. ``"1:100"``).  Omit to use all residues.
         out (str): Output file path for the form factor table.
         qmax (float): Maximum wavevector magnitude in nm^-1.
         dq (float): Wavevector spacing in nm^-1.
@@ -3752,6 +3767,9 @@ def cmd_intracf(
 
             scical intraCF --top conf.psf --traj system.xtc \\
                            --sel R001-R010 --gpu --out intraCF.dat
+
+            scical intraCF --top conf.psf --traj system.xtc --ref CA \\
+                           --resid 1:100 --out intraCF.dat --nproc 8
     """
     _suppress_warnings()
     import MDAnalysis as mda
@@ -3783,11 +3801,15 @@ def cmd_intracf(
 
     # Detect segments that contain matching reference atoms
     if ref == "all":
-        segments = [seg for seg in u.segments if len(seg.atoms) > 0]
+        sel_str = f"resid {resid}" if resid else "all"
+        segments = [seg for seg in u.segments
+                    if len(seg.atoms.select_atoms(sel_str)) > 0]
     else:
+        sel_str = (f"name {ref} and resid {resid}" if resid
+                   else f"name {ref}")
         segments = [
             seg for seg in u.segments
-            if len(seg.atoms.select_atoms(f"name {ref}")) > 0
+            if len(seg.atoms.select_atoms(sel_str)) > 0
         ]
 
     if not segments:
@@ -3823,6 +3845,7 @@ def cmd_intracf(
     typer.echo(f"[i] Topology    : {top}")
     typer.echo(f"[i] Trajectory  : {traj}")
     typer.echo(f"[i] Ref atom    : {'all atoms' if ref == 'all' else ref}")
+    typer.echo(f"[i] Residues    : {'resid ' + resid if resid else 'all'}")
     typer.echo(f"[i] Segments    : {len(segids)}")
     typer.echo(f"[i] Frames      : {n_frames}  "
                f"(start={start} stop={effective_stop} stride={stride})")
@@ -3835,7 +3858,7 @@ def cmd_intracf(
 
     if gpu:
         # GPU mode: single process, all frames on GPU
-        work_args = (top, traj, frame_indices, segids, ref, qs, 0)
+        work_args = (top, traj, frame_indices, segids, ref, resid, qs, 0)
         n_proc_frames, Wq_total = _intracf_worker_gpu(work_args)
         total_frames = n_proc_frames
     else:
@@ -3844,7 +3867,7 @@ def cmd_intracf(
         chunks = [frame_indices[i::n_workers] for i in range(n_workers)]
 
         work_args = [
-            (top, traj, chunk, segids, ref, qs, dr, wid)
+            (top, traj, chunk, segids, ref, resid, qs, dr, wid)
             for wid, chunk in enumerate(chunks)
         ]
 
