@@ -944,8 +944,9 @@ def _write_dist_output(out_path, pairs, dist_block, all_frames):
     data   = np.column_stack([np.array(all_frames)] + [dist_block[i] for i in range(len(pairs))])
     W      = 14
     labels = [_pair_label(r1, s1, r2, s2) for r1, s1, r2, s2 in pairs]
+    frame_col = "frame"
     header = " ".join(
-        [f"{\'frame\':>{W - 2}}"] + [f"{lbl:>{W}}" for lbl in labels]
+        [f"{frame_col:>{W - 2}}"] + [f"{lbl:>{W}}" for lbl in labels]
     )
     np.savetxt(out_path, data, header=header,
                fmt=[f"%{W}.0f"] + [f"%{W}.4f"] * len(pairs))
