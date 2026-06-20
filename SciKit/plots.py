@@ -652,41 +652,16 @@ def plot_hist2d(ax, x, y, bins=50, log_scale=False, contours=False, **kwargs):
 
 
 
-def plot_hist2d_contour(ax, x, y, levels=5, fill_color="steelblue", fill_alpha=0.4,
+def plot_hist2d_contour(ax, x, y, levels=5, n_levels=None, fill_color="steelblue", fill_alpha=0.4,
                         line_color="steelblue", line_alpha=0.9, linewidths=1.5,
                         gridsize=100, bw_method="scott",
 ):
-    """
-    Plot a 2D histogram as filled contours with contour lines on a given Axes.
-
-    Parameters
-    ----------
-    ax : matplotlib.axes.Axes
-    x, y : array-like of shape (N,)
-    levels : int, float, or array-like
-        - int   → number of auto-spaced levels.
-        - float → single density threshold; fills the region above it.
-        - array → explicit iso-density boundaries (must have >= 2 values).
-    fill_color : str or RGB tuple
-    fill_alpha : float
-    line_color : str or RGB tuple
-    line_alpha : float
-    linewidths : float or sequence of float
-    gridsize : int
-    bw_method : str, scalar, or callable
-
-    Returns
-    -------
-    cf : QuadContourSet  (filled)
-    cl : QuadContourSet  (lines)
-    """
     import numpy as np
     from scipy.stats import gaussian_kde
 
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
 
-    # Grid with a small padding so the outermost contour closes cleanly
     pad_x = (x.max() - x.min()) * 0.05
     pad_y = (y.max() - y.min()) * 0.05
     xi = np.linspace(x.min() - pad_x, x.max() + pad_x, gridsize)
@@ -702,7 +677,14 @@ def plot_hist2d_contour(ax, x, y, levels=5, fill_color="steelblue", fill_alpha=0
         if isinstance(levels, int):            # e.g. levels=5  → auto spacing
             pass                               # let matplotlib handle it
         else:                                  # e.g. levels=0.0032 → threshold
-            levels = [levels, float(Zi.max())]
+            threshold = float(levels)
+            if threshold >= Zi.max():
+                raise ValueError(
+                    f"Threshold {threshold:.6g} >= KDE max {Zi.max():.6g}. "
+                    "Lower your threshold."
+                )
+            n = n_levels if n_levels is not None else 2
+            levels = np.linspace(threshold, Zi.max() * 1.01, n + 1)
     # array-like: pass through unchanged (user's responsibility to have >= 2)
     # ──────────────────────────────────────────────────────────────────────────
 
