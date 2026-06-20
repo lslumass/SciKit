@@ -650,8 +650,10 @@ def mylinregress(xs, ys, xrange=None):
     
     Returns
     -------
-    r_value : float
-        Correlation coefficient of the linear fit.
+    (r_value, slope, intercept) : tuple
+        r_value : Correlation coefficient of the linear fit.
+        slope : Slope of the linear fit.
+        intercept : Y-intercept of the linear fit.
     x_fit : np.ndarray
         X values for the fitted line, either spanning the full range of xs or limited to xrange if provided.
     y_fit : np.ndarray
@@ -669,4 +671,4 @@ def mylinregress(xs, ys, xrange=None):
     else:
         x_fit = np.linspace(xs.min()*0.9, xs.max()*1.1, 200)
         y_fit = slope * x_fit + intercept
-    return r_value, x_fit, y_fit
+    return (r_value, slope, intercept), x_fit, y_fit
