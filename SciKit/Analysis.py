@@ -961,7 +961,7 @@ def cmd_dist(
     start: Annotated[Optional[int], typer.Option("--start")] = None,
     stop: Annotated[Optional[int], typer.Option("--stop")] = None,
     stride: Annotated[int, typer.Option("--stride")] = 1,
-    workers: Annotated[int, typer.Option("-n", "--workers",
+    nproc: Annotated[int, typer.Option("-n", "--nproc",
                help="Parallel worker processes")] = max(1, cpu_count() or 1),
 ):
     """Calculate **Cα–Cα distances** for residue pairs over a trajectory.
@@ -987,7 +987,7 @@ def cmd_dist(
         stop (Optional[int]): Last trajectory frame, exclusive
             (``None`` = last frame).
         stride (int): Step between analysed frames.
-        workers (int): Number of parallel worker processes; defaults to the
+        nproc (int): Number of parallel worker processes; defaults to the
             number of logical CPU cores.
 
     Output:
@@ -996,7 +996,7 @@ def cmd_dist(
 
     Example::
 
-            scical distance --top conf.psf --traj system.dcd -f pairs.dat --stride 2 --workers 8
+            scical distance --top conf.psf --traj system.dcd -f pairs.dat --stride 2 --nproc 8
     """
     _suppress_warnings()
     import MDAnalysis as mda
@@ -1020,7 +1020,7 @@ def cmd_dist(
     idx1, idx2 = _resolve_ca_indices(u0, all_pairs)
     del u0
 
-    slices   = _make_worker_slices(s, e, st, workers)
+    slices   = _make_worker_slices(s, e, st, nproc)
     work_args = [
         (top, traj, idx1, idx2, sl, wid)
         for wid, sl in enumerate(slices)
