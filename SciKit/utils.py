@@ -709,7 +709,7 @@ def bondfit(bins, vals, maxfev=2000000):
 
     param, cov = curve_fit(pb, bins, vals, p0=[100, 1, 0.0], bounds=([0, 0, 0], [np.inf, np.inf, 1]), maxfev=maxfev)
     k, a, b = param[0], param[1], param[2]
-    xs = np.linspace(bins[0], bins[-1])
+    xs = np.linspace(bins[0], bins[-1], 2000)
     ys = pb(xs, k, a, b)
     return k, b, xs, ys
 
@@ -754,7 +754,7 @@ def anglefit(bins, vals, maxfev=2000000):
                            maxfev=maxfev
                            )
     k, a, b = param[0], param[1], param[2]
-    xs = np.linspace(bins[0], bins[-1])
+    xs = np.linspace(bins[0], bins[-1], 2000)
     ys = pb(xs, k, a, b)
     return k, b, xs/np.pi*180, ys
 
@@ -818,7 +818,7 @@ def dihedralfit(bins, vals, multi=0, maxfev=2000000):
         )
         k, a, b = param
 
-    xs = np.linspace(bins[0], bins[-1])
+    xs = np.linspace(bins[0], bins[-1], 2000)
     ys = pb(xs, k, a, b, n)
     return k, b, n, xs/np.pi*180, ys
 
