@@ -750,7 +750,7 @@ def anglefit(bins, vals, maxfev=2000000):
     bins = bins/180*np.pi
     param, cov = curve_fit(pb, bins, vals, 
                            p0=[1, 1, 1.5], 
-                           bounds=([0, 0, 0], [np.inf, np.inf, np.pi]), 
+                           bounds=([0, 0, -np.pi], [np.inf, np.inf, np.pi]), 
                            maxfev=maxfev
                            )
     k, a, b = param[0], param[1], param[2]
