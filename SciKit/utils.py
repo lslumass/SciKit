@@ -750,7 +750,7 @@ def anglefit(bins, vals, maxfev=2000000):
     bins = bins/180*np.pi
     param, cov = curve_fit(pb, bins, vals, 
                            p0=[1, 1, 1.5], 
-                           bounds=([0, -1*np.inf, 0], [np.inf, np.inf, np.pi]), 
+                           bounds=([0, 0, 0], [np.inf, np.inf, np.pi]), 
                            maxfev=maxfev
                            )
     k, a, b = param[0], param[1], param[2]
@@ -801,7 +801,7 @@ def dihedralfit(bins, vals, multi=0, maxfev=2000000):
         param, cov = curve_fit(
             pb, bins, vals,
             p0=[10, 0.0001, -0.5, 1],
-            bounds=([0, -np.inf, -np.pi, 1], [np.inf, np.inf, np.pi, 5]),
+            bounds=([0, 0, -np.pi, 1], [np.inf, np.inf, np.pi, 5]),
             maxfev=maxfev
         )
         k, a, b, n = param
@@ -813,7 +813,7 @@ def dihedralfit(bins, vals, multi=0, maxfev=2000000):
         param, cov = curve_fit(
             pb_fixed, bins, vals,
             p0=[10, 0.0001, -0.5],
-            bounds=([0, -np.inf, -np.pi], [np.inf, np.inf, np.pi]),
+            bounds=([0, 0, -np.pi], [np.inf, np.inf, np.pi]),
             maxfev=maxfev
         )
         k, a, b = param
