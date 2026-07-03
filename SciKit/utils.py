@@ -748,13 +748,17 @@ def anglefit(bins, vals, maxfev=2000000):
         return a*np.exp(-k*(x-b)**2/kBT)
     
     bins = bins/180*np.pi
-    param, cov = curve_fit(pb, bins, vals, p0=[1, 1, 1.5], bounds=([0, -1*np.inf, 0], [np.inf, np.inf, np.pi]), maxfev=maxfev)
+    param, cov = curve_fit(pb, bins, vals, 
+                           p0=[1, 1, 1.5], 
+                           bounds=([0, -1*np.inf, 0], [np.inf, np.inf, np.pi]), 
+                           maxfev=maxfev
+                           )
     k, a, b = param[0], param[1], param[2]
     xs = np.linspace(bins[0], bins[-1])
     ys = pb(xs, k, a, b)
     return k, b, xs/np.pi*180, ys
 
-def dihedralfit(bins, vals, maxfev=2000000):
+def dihedralfit(bins, vals, multi=0, maxfev=2000000):
     """
     Fit a dihedral-angle distribution (in degrees) to a periodic torsion
     potential of the form P(x) = a * exp(-k*(1+cos(n*x-b)) / kBT), working
@@ -768,8 +772,7 @@ def dihedralfit(bins, vals, maxfev=2000000):
     vals : array_like
         Probability/density values corresponding to each bin.
     maxfev : int, optional
-        Maximum number of function evaluations for curve_fit (default 2000000,
-        though this function internally uses a fixed value of 3000000).
+        Maximum number of function evaluations for curve_fit (default 2000000.
 
     Returns
     -------
@@ -793,8 +796,28 @@ def dihedralfit(bins, vals, maxfev=2000000):
         return a*np.exp(-k*(1+np.cos(n*x-b))/kBT)
 
     bins = bins/180*np.pi
-    param, cov = curve_fit(pb, bins, vals, p0=[10, 0.0001, -0.5, 1], bounds=([0, -1*np.inf, -1*np.pi, 1], [np.inf, np.inf, np.pi, 5]), maxfev=3000000)
-    k, a, b, n = param[0], param[1], param[2], param[3]
+
+    if multi == 0:
+        param, cov = curve_fit(
+            pb, bins, vals,
+            p0=[10, 0.0001, -0.5, 1],
+            bounds=([0, -np.inf, -np.pi, 1], [np.inf, np.inf, np.pi, 5]),
+            maxfev=maxfev
+        )
+        k, a, b, n = param
+    else:
+        n = multi
+        def pb_fixed(x, k, a, b):
+            return pb(x, k, a, b, n)
+
+        param, cov = curve_fit(
+            pb_fixed, bins, vals,
+            p0=[10, 0.0001, -0.5],
+            bounds=([0, -np.inf, -np.pi], [np.inf, np.inf, np.pi]),
+            maxfev=maxfev
+        )
+        k, a, b = param
+
     xs = np.linspace(bins[0], bins[-1])
     ys = pb(xs, k, a, b, n)
     return k, b, n, xs/np.pi*180, ys
