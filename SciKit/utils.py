@@ -672,3 +672,130 @@ def mylinregress(xs, ys, xrange=None):
         x_fit = np.linspace(xs.min()*0.9, xs.max()*1.1, 200)
         y_fit = slope * x_fit + intercept
     return (r_value, slope, intercept), x_fit, y_fit
+
+
+def bondfit(bins, vals, maxfev=2000000):
+    """
+    Fit a bond-length distribution to a harmonic (Gaussian) potential of the
+    form P(x) = a * exp(-k*(x-b)^2 / kBT) to extract a force constant.
+
+    Parameters
+    ----------
+    bins : array_like
+        Bond length values (x-axis of the histogram/distribution).
+    vals : array_like
+        Probability/density values corresponding to each bin.
+    maxfev : int, optional
+        Maximum number of function evaluations for curve_fit (default 2000000).
+
+    Returns
+    -------
+    k : float
+        Fitted force constant.
+    b : float
+        Fitted equilibrium bond length.
+    xs : ndarray
+        Finely sampled x-values spanning the input bin range, for plotting.
+    ys : ndarray
+        Fitted curve evaluated at xs.
+    """
+    from scipy.optimize import curve_fit
+
+    T = 303.0  
+    kB = 0.0083144626  # kJ/(mol K)
+    kBT = kB * T
+    def pb(x, k, a, b):
+        return a*np.exp(-k*(x-b)**2/kBT)
+
+    param, cov = curve_fit(pb, bins, vals, p0=[100, 1, 0.0], bounds=([0, 0, 0], [np.inf, np.inf, 1]), maxfev=maxfev)
+    k, a, b = param[0], param[1], param[2]
+    xs = np.linspace(bins[0], bins[-1])
+    ys = pb(xs, k, a, b)
+    return k, b, xs, ys
+
+def anglefit(bins, vals, maxfev=2000000):
+    """
+    Fit a bond-angle distribution (in degrees) to a harmonic (Gaussian)
+    potential of the form P(x) = a * exp(-k*(x-b)^2 / kBT) to extract a
+    force constant, working internally in radians.
+
+    Parameters
+    ----------
+    bins : array_like
+        Bond angle values in degrees.
+    vals : array_like
+        Probability/density values corresponding to each bin.
+    maxfev : int, optional
+        Maximum number of function evaluations for curve_fit (default 2000000).
+
+    Returns
+    -------
+    k : float
+        Fitted force constant.
+    b : float
+        Fitted equilibrium angle, in radians.
+    xs : ndarray
+        Finely sampled x-values (converted back to degrees) spanning the
+        input bin range, for plotting.
+    ys : ndarray
+        Fitted curve evaluated at xs.
+    """
+    from scipy.optimize import curve_fit
+    T = 303.0  
+    kB = 0.0083144626  # kJ/(mol K)
+    kBT = kB * T
+    def pb(x, k, a, b):
+        return a*np.exp(-k*(x-b)**2/kBT)
+    
+    bins = bins/180*np.pi
+    param, cov = curve_fit(pb, bins, vals, p0=[1, 1, 1.5], bounds=([0, -1*np.inf, 0], [np.inf, np.inf, np.pi]), maxfev=maxfev)
+    k, a, b = param[0], param[1], param[2]
+    xs = np.linspace(bins[0], bins[-1])
+    ys = pb(xs, k, a, b)
+    return k, b, xs/np.pi*180, ys
+
+def dihedralfit(bins, vals, maxfev=2000000):
+    """
+    Fit a dihedral-angle distribution (in degrees) to a periodic torsion
+    potential of the form P(x) = a * exp(-k*(1+cos(n*x-b)) / kBT), working
+    internally in radians, to extract a force constant, phase, and
+    periodicity.
+
+    Parameters
+    ----------
+    bins : array_like
+        Dihedral angle values in degrees.
+    vals : array_like
+        Probability/density values corresponding to each bin.
+    maxfev : int, optional
+        Maximum number of function evaluations for curve_fit (default 2000000,
+        though this function internally uses a fixed value of 3000000).
+
+    Returns
+    -------
+    k : float
+        Fitted force constant.
+    b : float
+        Fitted phase offset, in radians.
+    n : float
+        Fitted periodicity (multiplicity).
+    xs : ndarray
+        Finely sampled x-values (converted back to degrees) spanning the
+        input bin range, for plotting.
+    ys : ndarray
+        Fitted curve evaluated at xs.
+    """
+    from scipy.optimize import curve_fit
+    T = 303.0  
+    kB = 0.0083144626  # kJ/(mol K)
+    kBT = kB * T
+    def pb(x, k, a, b, n):
+        return a*np.exp(-k*(1+np.cos(n*x-b))/kBT)
+
+    bins = bins/180*np.pi
+    param, cov = curve_fit(pb, bins, vals, p0=[10, 0.0001, -0.5, 1], bounds=([0, -1*np.inf, -1*np.pi, 1], [np.inf, np.inf, np.pi, 5]), maxfev=3000000)
+    k, a, b, n = param[0], param[1], param[2], param[3]
+    xs = np.linspace(bins[0], bins[-1])
+    ys = pb(xs, k, a, b, n)
+    return k, b, n, xs/np.pi*180, ys
+
