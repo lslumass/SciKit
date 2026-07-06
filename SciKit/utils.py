@@ -674,7 +674,7 @@ def mylinregress(xs, ys, xrange=None):
     return (r_value, slope, intercept), x_fit, y_fit
 
 
-def bondfit(bins, vals, maxfev=2000000):
+def bondfit(bins, vals, maxfev=2000000, *args, **kwargs):
     """
     Fit a bond-length distribution to a harmonic (Gaussian) potential of the
     form P(x) = a * exp(-k*(x-b)^2 / kBT) to extract a force constant.
@@ -707,7 +707,7 @@ def bondfit(bins, vals, maxfev=2000000):
     def pb(x, k, a, b):
         return a*np.exp(-k*(x-b)**2/kBT)
 
-    param, cov = curve_fit(pb, bins, vals, p0=[100, 1, 0.0], bounds=([0, 0, 0], [np.inf, np.inf, 1]), maxfev=maxfev)
+    param, cov = curve_fit(pb, bins, vals, p0=[100, 1, 0.0], bounds=([0, 0, 0], [np.inf, np.inf, 1]), maxfev=maxfev, *args, **kwargs)
     k, a, b = param[0], param[1], param[2]
     xs = np.linspace(bins[0], bins[-1], 2000)
     ys = pb(xs, k, a, b)
