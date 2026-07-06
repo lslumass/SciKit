@@ -674,7 +674,7 @@ def mylinregress(xs, ys, xrange=None):
     return (r_value, slope, intercept), x_fit, y_fit
 
 
-def bondfit(bins, vals, maxfev=2000000, *args, **kwargs):
+def bondfit(bins, vals, p0=[100, 1, 0.0], bounds=([0, 0, 0], [np.inf, np.inf, 1]), maxfev=2000000, *args, **kwargs):
     """
     Fit a bond-length distribution to a harmonic (Gaussian) potential of the
     form P(x) = a * exp(-k*(x-b)^2 / kBT) to extract a force constant.
@@ -707,13 +707,13 @@ def bondfit(bins, vals, maxfev=2000000, *args, **kwargs):
     def pb(x, k, a, b):
         return a*np.exp(-k*(x-b)**2/kBT)
 
-    param, cov = curve_fit(pb, bins, vals, p0=[100, 1, 0.0], bounds=([0, 0, 0], [np.inf, np.inf, 1]), maxfev=maxfev, *args, **kwargs)
+    param, cov = curve_fit(pb, bins, vals, p0=p0, bounds=bounds, maxfev=maxfev, *args, **kwargs)
     k, a, b = param[0], param[1], param[2]
     xs = np.linspace(bins[0], bins[-1], 2000)
     ys = pb(xs, k, a, b)
     return k, b, xs, ys
 
-def anglefit(bins, vals, maxfev=2000000):
+def anglefit(bins, vals, p0=[1, 1, 1.5], bounds=([0, 0, -np.pi], [np.inf, np.inf, np.pi]), maxfev=2000000, *args, **kwargs):
     """
     Fit a bond-angle distribution (in degrees) to a harmonic (Gaussian)
     potential of the form P(x) = a * exp(-k*(x-b)^2 / kBT) to extract a
@@ -748,17 +748,13 @@ def anglefit(bins, vals, maxfev=2000000):
         return a*np.exp(-k*(x-b)**2/kBT)
     
     bins = bins/180*np.pi
-    param, cov = curve_fit(pb, bins, vals, 
-                           p0=[1, 1, 1.5], 
-                           bounds=([0, 0, -np.pi], [np.inf, np.inf, np.pi]), 
-                           maxfev=maxfev
-                           )
+    param, cov = curve_fit(pb, bins, vals, p0=p0, bounds=bounds, maxfev=maxfev, *args, **kwargs)
     k, a, b = param[0], param[1], param[2]
     xs = np.linspace(bins[0], bins[-1], 2000)
     ys = pb(xs, k, a, b)
     return k, b, xs/np.pi*180, ys
 
-def dihedralfit(bins, vals, multi=0, maxfev=2000000):
+def dihedralfit(bins, vals, multi=0, maxfev=2000000, *args, **kwargs):
     """
     Fit a dihedral-angle distribution (in degrees) to a periodic torsion
     potential of the form P(x) = a * exp(-k*(1+cos(n*x-b)) / kBT), working
@@ -802,7 +798,9 @@ def dihedralfit(bins, vals, multi=0, maxfev=2000000):
             pb, bins, vals,
             p0=[10, 0.0001, -0.5, 1],
             bounds=([0, 0, -np.pi, 1], [np.inf, np.inf, np.pi, 5]),
-            maxfev=maxfev
+            maxfev=maxfev,
+            *args,
+            **kwargs
         )
         k, a, b, n = param
     else:
@@ -814,7 +812,9 @@ def dihedralfit(bins, vals, multi=0, maxfev=2000000):
             pb_fixed, bins, vals,
             p0=[10, 0.0001, -0.5],
             bounds=([0, 0, -np.pi], [np.inf, np.inf, np.pi]),
-            maxfev=maxfev
+            maxfev=maxfev,
+            *args,
+            **kwargs
         )
         k, a, b = param
 
