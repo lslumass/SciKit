@@ -1571,12 +1571,13 @@ def _contacts_worker(args):
     import MDAnalysis as mda
     from MDAnalysis.lib.distances import capped_distance
 
+    # Added sel_str to the unpacked arguments
     (top, traj, cutoff, frame_indices,
      atom_to_local, atom_to_copy, atom_to_comp,
-     pair_specs) = args
+     pair_specs, sel_str) = args
 
     u       = mda.Universe(top, traj) if traj else mda.Universe(top)
-    all_hvy = u.select_atoms(HEAVY_ATOMS)
+    all_hvy = u.select_atoms(sel_str) # Use the dynamic selection
 
     partials = {}
     for spec in pair_specs:
@@ -1606,6 +1607,10 @@ def _contacts_worker(args):
         cmpi = atom_to_comp[ri]
         cmpj = atom_to_comp[rj]
 
+        # Filter out garbage indices (unmapped atoms from np.full)
+        valid = (li != -1) & (lj != -1)
+        li, lj, ci, cj, cmpi, cmpj = li[valid], lj[valid], ci[valid], cj[valid], cmpi[valid], cmpj[valid]
+
         for spec in pair_specs:
             cx, cy, N_X, N_Y, _, same = spec
             key = (cx, cy)
@@ -1617,7 +1622,7 @@ def _contacts_worker(args):
                     k    = np.unique(np.stack([ci[intra_mask], li[intra_mask], lj[intra_mask]], axis=1), axis=0)
                     flat = k[:, 1] * N_X + k[:, 2]
                     m    = np.bincount(flat, minlength=N_X * N_X).reshape(N_X, N_X).astype(np.float64)
-                    partials[key]["intra"] += m + m.T
+                    partials[key]["intra"] += m
 
                 # ── Inter (different copies, same component) ──────────────
                 inter_mask = (cmpi == cx) & (cmpj == cx) & (ci != cj)
@@ -1626,7 +1631,7 @@ def _contacts_worker(args):
                                                 li[inter_mask], lj[inter_mask]], axis=1), axis=0)
                     flat2 = k2[:, 2] * N_X + k2[:, 3]
                     m2    = np.bincount(flat2, minlength=N_X * N_Y).reshape(N_X, N_Y).astype(np.float64)
-                    partials[key]["inter"] += m2 + m2.T
+                    partials[key]["inter"] += m2
 
             else:
                 # ── Cross-component contacts (cx → cy and cy → cx) ───────
@@ -1658,112 +1663,97 @@ def cmd_contacts(
     pairs: Annotated[Optional[str], typer.Option("--pairs",
         help="Contact pairs to compute e.g. 'A-A A-B B-B'. "
              "Default: all same-component pairs.")] = None,
+    ref: Annotated[str, typer.Option("--ref", 
+        help="Selection string for the reference atom defining a residue sequence (default: 'name CA'). Give the unique atom name for each residue.")] = "name CA",
+    sel: Annotated[str, typer.Option("--sel", 
+        help="Selection string for atoms involved in the contact calculation.")] = "name CA CB CC CD CE CF",
     start: Annotated[int, typer.Option("--start")] = 0,
     stop: Annotated[Optional[int], typer.Option("--stop")] = None,
     stride: Annotated[int, typer.Option("--stride")] = 1,
     nproc: Annotated[int, typer.Option("--nproc")] = 1,
     out: Annotated[str, typer.Option("--out", help="Output stem")] = "contact_map.npy",
 ):
-    """Calculate intra- and inter-chain **contact maps** for multi-component systems (heavy-atom, parallel).
+    """Calculate intra- and inter-chain **contact maps** for multi-component systems (parallel).
 
-    Identifies contacts between heavy atoms (CA, CB, CC, CD, CE, CF) within
-    a user-defined distance cutoff, accounting for periodic boundary conditions.
-    Supports systems containing multiple distinct peptide/protein components
-    (e.g. 100 copies of chain A + 100 copies of chain B).
+    Identifies contacts between target atoms (--sel) within a user-defined distance cutoff, 
+    accounting for periodic boundary conditions. Supports systems containing multiple distinct 
+    components (e.g., proteins, lipids, coarse-grained polymers).
 
-    Components are defined by grouping auto-detected segids::
+    Components are defined by grouping auto-detected segids using a reference atom (--ref)::
 
-        --components "A:100 B:100 C:100"   # first 100 segids → A, next 100 → B, …
+        --components "A:100 B:100"   # first 100 segids → A, next 100 → B
 
     Contact pairs to compute::
 
         --pairs "A-A A-B B-B"   # default: all same-component pairs
 
-    Contacts are classified as:
-
-    - **Intra** — same chain copy, sequence separation ≥ 4 residues (same-component pairs only).
-    - **Inter** — different chain copies of the same component, or cross-component contacts.
-
     Normalisation: sum over all copy pairs / (n_copies_X × n_frames), giving the
-    average contacts that residue *i* of one copy makes with residue *j* per frame.
-
-    Args:
-        top (str): Path to the topology file (PSF).
-        traj (Optional[str]): Path to the trajectory file.  When omitted,
-            only the single frame in *top* is analysed.
-        cutoff (float): Heavy-atom distance cutoff in ångström.
-        components (Optional[str]): Component definitions e.g. ``"A:100 B:100"``.
-            When omitted all segids are assigned to a single component ``"A"``.
-        pairs (Optional[str]): Contact pairs to compute e.g. ``"A-A A-B"``.
-            When omitted, all same-component pairs are computed.
-        start (int): Index of the first trajectory frame.
-        stop (Optional[int]): Index of the last trajectory frame (exclusive);
-            ``None`` means use all frames.
-        stride (int): Step between analysed frames.
-        nproc (int): Number of parallel worker processes.
-        out (str): Output file stem.  Per requested pair ``X-Y`` the following
-            files are written:
-
-            - ``<stem>_X-Y_intra.npy`` — intra-copy map (same-component only).
-            - ``<stem>_X-Y_inter.npy`` — inter-copy map (same-component only).
-            - ``<stem>_X-Y_total.npy`` — combined (or cross-component) map.
-            - ``<stem>_X-Y_resids.npy`` / ``<stem>_X-Y_resids_X.npy`` / ``_resids_Y.npy``.
-
-    Example::
-
-            # Single-component system (original behaviour)
-            scical contacts --top system.psf --traj traj.dcd --cutoff 8.0 --stride 5 --nproc 8
-
-            # Multi-component: 100 A-chains + 100 B-chains, compute A-A and A-B maps
-            scical contacts --top system.psf --traj traj.dcd \\
-                --components "A:100 B:100" --pairs "A-A A-B" --nproc 8
+    average contacts that residue i of one copy makes with residue j per frame.
+    Warning: for A-B contacts, if number of copies is not symmetric, the normalization is not symmetric,
+    meaning the contact map will not be symmetric A-B != B-A.
     """
     _suppress_warnings()
     import MDAnalysis as mda
+    import time
+    import multiprocessing as mp
+    import numpy as np
 
-    u      = mda.Universe(top, traj) if traj else mda.Universe(top)
-    all_ca = u.select_atoms("name CA")
-    segids = list(dict.fromkeys(all_ca.segids))
+    u = mda.Universe(top, traj) if traj else mda.Universe(top)
+    
+    # ── Component setup using --ref ────────────────────────────────────────
+    all_ref = u.select_atoms(ref)
+    if len(all_ref) == 0:
+        typer.echo(f"[!] No atoms found matching reference selection: '{ref}'", err=True)
+        raise typer.Exit(1)
+        
+    segids = list(dict.fromkeys(all_ref.segids))
     n_traj = len(u.trajectory)
 
-    # ── Component setup ────────────────────────────────────────────────────
     comp_map    = _parse_components(components, segids)
     comp_labels = list(comp_map.keys())
 
     req_pairs = _parse_pairs(pairs, comp_labels) if pairs else [(x, x) for x in comp_labels]
 
-    comp_ca = {label: [u.select_atoms(f"segid {s} and name CA") for s in segs]
+    comp_ref = {label: [u.select_atoms(f"segid {s} and ({ref})") for s in segs]
                for label, segs in comp_map.items()}
+               
     comp_N  = {}
-    for label, ca_list in comp_ca.items():
-        Ns = [len(ca) for ca in ca_list]
+    for label, ref_list in comp_ref.items():
+        Ns = [len(r) for r in ref_list]
         if len(set(Ns)) != 1:
-            typer.echo(f"[!] Component {label} has unequal residue counts: {set(Ns)}", err=True)
+            typer.echo(f"[!] Component {label} has unequal residue counts based on '{ref}': {set(Ns)}", err=True)
             raise typer.Exit(1)
         comp_N[label] = Ns[0]
 
     comp_idx = {label: i for i, label in enumerate(comp_labels)}
 
-    # ── Lookup arrays: heavy atom row → (local_res, copy_within_comp, comp_idx) ──
-    all_hvy     = u.select_atoms(HEAVY_ATOMS)
+    # ── Lookup arrays using --sel ──────────────────────────────────────────
+    all_hvy     = u.select_atoms(sel)
+    if len(all_hvy) == 0:
+        typer.echo(f"[!] No atoms found matching contact selection: '{sel}'", err=True)
+        raise typer.Exit(1)
+        
     M           = len(all_hvy)
     all_hvy_idx = all_hvy.indices
 
-    atom_to_local = np.empty(M, dtype=np.int32)
-    atom_to_copy  = np.empty(M, dtype=np.int32)
-    atom_to_comp  = np.empty(M, dtype=np.int32)
+    # Initialize with -1 to safely handle atoms that match --sel but aren't in a --ref residue
+    atom_to_local = np.full(M, -1, dtype=np.int32)
+    atom_to_copy  = np.full(M, -1, dtype=np.int32)
+    atom_to_comp  = np.full(M, -1, dtype=np.int32)
 
-    for label, ca_list in comp_ca.items():
+    for label, ref_list in comp_ref.items():
         cidx = comp_idx[label]
-        for copy_within, ca in enumerate(ca_list):
-            for res_local, res in enumerate(ca.residues):
+        for copy_within, ref_atoms in enumerate(ref_list):
+            for res_local, res in enumerate(ref_atoms.residues):
+                # Find which contact atoms (--sel) belong to this specific residue
                 res_hvy_idx = np.intersect1d(res.atoms.indices, all_hvy_idx)
-                rows = np.searchsorted(all_hvy_idx, res_hvy_idx)
-                atom_to_local[rows] = res_local
-                atom_to_copy[rows]  = copy_within
-                atom_to_comp[rows]  = cidx
+                if len(res_hvy_idx) > 0:
+                    rows = np.searchsorted(all_hvy_idx, res_hvy_idx)
+                    atom_to_local[rows] = res_local
+                    atom_to_copy[rows]  = copy_within
+                    atom_to_comp[rows]  = cidx
 
-    comp_resids  = {label: comp_ca[label][0].residues.resids for label in comp_labels}
+    comp_resids  = {label: comp_ref[label][0].residues.resids for label in comp_labels}
     comp_ncopies = {label: len(segs) for label, segs in comp_map.items()}
 
     pair_specs = [
@@ -1771,13 +1761,16 @@ def cmd_contacts(
         for x, y in req_pairs
     ]
 
-    del u
+    del u  # Free memory before multiprocessing
 
+    # ── Multiprocessing setup ──────────────────────────────────────────────
     frames   = list(range(start, stop or n_traj, stride))
     n_frames = len(frames)
     nprocs   = min(nproc, n_frames)
 
-    typer.echo(f"Components : {', '.join(f'{l}×{comp_ncopies[l]}(N={comp_N[l]})' for l in comp_labels)}")
+    typer.echo(f"Reference  : '{ref}'")
+    typer.echo(f"Selection  : '{sel}'")
+    typer.echo(f"Components : {', '.join(f'{l}×{comp_ncopies[l]} (N={comp_N[l]})' for l in comp_labels)}")
     typer.echo(f"Pairs      : {', '.join(f'{x}-{y}' for x, y in req_pairs)}")
     typer.echo(f"Cutoff     : {cutoff} Å  ({cutoff / 10:.2f} nm)")
     typer.echo(f"Frames     : {n_frames}  (stride={stride})")
@@ -1785,7 +1778,7 @@ def cmd_contacts(
 
     chunks      = [frames[i::nprocs] for i in range(nprocs)]
     worker_args = [
-        (top, traj, cutoff, chunk, atom_to_local, atom_to_copy, atom_to_comp, pair_specs)
+        (top, traj, cutoff, chunk, atom_to_local, atom_to_copy, atom_to_comp, pair_specs, sel)
         for chunk in chunks
     ]
 
