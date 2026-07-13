@@ -2161,6 +2161,88 @@ def _find_clusters_and_stats(segs, grps, r_cutoff: float = 8.0):
 
     return list(clusters.values()), monomer, n_clusters, max_cluster_size, grps
 
+def _format_clusters_line(frame: int, clusters: list, sel_indices: list, u) -> str:
+    """Format one frame's cluster composition as a single pipe-delimited line.
+
+    Format::
+
+        <frame> | <size_list> | <count_list> | <details>
+
+    - **size_list** — unique cluster sizes, descending, comma-separated
+      (e.g. ``6,5,4,1``).
+    - **count_list** — number of clusters at each size, comma-separated,
+      positionally aligned with *size_list* (e.g. ``1,2,2,50`` means
+      1 cluster of size 6, 2 of size 5, 2 of size 4, 50 of size 1).
+    - **details** — one group per unique size (same order as *size_list*),
+      groups joined by ``-``. Within a group:
+
+        * size > 1: multiple clusters of that size are separated by ``;``,
+          and segids within a single cluster are comma-separated, e.g.
+          ``R011,R013,R044,R055,R061;R002,R009,R018,R022,R030`` for two
+          size-5 clusters.
+        * size == 1 (monomers): every monomer segid is joined directly by
+          ``-`` (not comma), e.g. ``R001-R002-R003``, since each monomer
+          is a singleton cluster and the per-cluster comma grouping would
+          be redundant.
+
+    Args:
+        frame (int): Trajectory frame number (``ts.frame``).
+        clusters (list[list[int]]): Clusters as **local** indices into the
+            clustered segment list (as returned by
+            :func:`_find_clusters_and_stats`).
+        sel_indices (list[int]): Universe-level segment indices used for
+            clustering; ``sel_indices[i]`` is the universe index of local
+            index ``i``.
+        u (MDAnalysis.Universe): Universe used to resolve segids.
+
+    Returns:
+        str: The formatted line (no trailing newline).
+
+    Examples::
+
+        # 1 cluster of size 6, 2 of size 5, 2 of size 4, 50 monomers
+        "12 | 6,5,4,1 | 1,2,2,50 | R011,R013,R044,R055,R061,R017-" \\
+        "R002,R009,R018,R022,R030;R014,R016,R019,R023,R031-" \\
+        "R004,R006,R008,R026;R012,R015,R020,R027-" \\
+        "R001-R003-R005-R007-...-R099"
+    """
+    # Sort clusters largest-first.
+    sorted_clusters = sorted(clusters, key=len, reverse=True)
+
+    # Group clusters by size, preserving descending order of first appearance.
+    size_to_clusters: dict = {}
+    order: list = []
+    for cluster in sorted_clusters:
+        sz = len(cluster)
+        if sz not in size_to_clusters:
+            size_to_clusters[sz] = []
+            order.append(sz)
+        size_to_clusters[sz].append(cluster)
+
+    size_list  = order                                     # already descending
+    count_list = [len(size_to_clusters[sz]) for sz in size_list]
+
+    detail_groups = []
+    for sz in size_list:
+        group_clusters = size_to_clusters[sz]
+        if sz == 1:
+            # Monomers: dash-join every segid directly.
+            segids = [u.segments[sel_indices[c[0]]].segid for c in group_clusters]
+            detail_groups.append("-".join(segids))
+        else:
+            # Multiple clusters of this size: comma-join segids within a
+            # cluster, semicolon-join multiple clusters of the same size.
+            cluster_strs = [
+                ",".join(u.segments[sel_indices[i]].segid for i in c)
+                for c in group_clusters
+            ]
+            detail_groups.append(";".join(cluster_strs))
+
+    size_str    = ",".join(str(s) for s in size_list)
+    count_str   = ",".join(str(c) for c in count_list)
+    details_str = "-".join(detail_groups)
+
+    return f"{frame} | {size_str} | {count_str} | {details_str}"
 
 # ---------------------------------------------------------------------------
 #  PBC recentering
@@ -2305,6 +2387,7 @@ def _worker(
     chunk_start_rank: int,       # global rank of traj_indices[0] among analysed frames
     tmp_traj: Optional[str],     # path for this worker's temporary XTC, or None
     sel_indices: list,           # universe-level segment indices used for clustering
+    save_clusters: bool,         # whether to record per-frame cluster-details lines
 ) -> dict:
     """Analyse a contiguous subset of frames in a subprocess.
 
@@ -2333,11 +2416,14 @@ def _worker(
             fragment, or ``None`` if recentering is disabled.
         sel_indices (list[int]): Universe-level segment indices to use for
             clustering.  Passed straight through to :func:`_grp_init`.
+        save_clusters (bool): Whether to build a formatted cluster-details
+            line for each frame (see :func:`_format_clusters_line`).
 
     Returns:
         dict:
             ``stats_data``       — list of ``(frame_number, monomers, clusters, max_size)``
             ``density_profiles`` — list of ``(global_rank, r_bins, conc)``
+            ``cluster_lines``    — list of ``(frame_number, line)``
     """
     _suppress_warnings()
     import MDAnalysis as mda
@@ -2354,6 +2440,7 @@ def _worker(
 
     stats_data:       list = []
     density_profiles: list = []
+    cluster_lines:    list = []
 
     writer = mda.Writer(tmp_traj, n_atoms=u.atoms.n_atoms) if (recenter and tmp_traj) else None
 
@@ -2374,6 +2461,12 @@ def _worker(
             clusters, monomer, n_clusters, max_size, _ = _find_clusters_and_stats(
                 segs, grps_frame, r_cutoff=rcut
             )
+
+            if save_clusters:
+                cluster_lines.append((
+                    ts.frame,
+                    _format_clusters_line(ts.frame, clusters, sel_indices, u),
+                ))
 
             if recenter:
                 # Translate local cluster indices → universe-level segment
@@ -2412,6 +2505,7 @@ def _worker(
     return {
         "stats_data":       stats_data,
         "density_profiles": density_profiles,
+        "cluster_lines":    cluster_lines,
     }
 
 
@@ -2486,6 +2580,14 @@ def cmd_aggr(
                           "Default: all segments."
                       ),
                   )] = None,
+    clusters:     Annotated[bool, typer.Option(
+                      "--clusters/--no-clusters",
+                      help="Save per-frame cluster composition (size + segids) to --clusterdat",
+                  )] = False,
+    clusterdat:   Annotated[str, typer.Option(
+                      "--clusterdat",
+                      help="Cluster-details output file",
+                  )] = "cluster_details.dat",
 ):
     """Analyse protein **aggregation**: cluster detection, PBC recentering, and radial density.
 
@@ -2510,6 +2612,10 @@ def cmd_aggr(
         # Serial — cluster statistics only, select by segment name
         scical aggr --top conf.psf --traj system.xtc --rcut 8.0 --sel R001-R099
 
+        # Also save per-frame cluster composition details
+        scical aggr --top conf.psf --traj system.xtc --rcut 8.0 --sel R001-R099 \\
+            --clusters --clusterdat cluster_details.dat
+
         # Multiple segment types
         scical aggr --top conf.psf --traj system.xtc --rcut 8.0 \\
             --sel R001-R099,K001-K010
@@ -2523,6 +2629,11 @@ def cmd_aggr(
     """
     _suppress_warnings()
     import MDAnalysis as mda
+
+    # The CLI flag is named `clusters`, but the per-frame cluster-membership
+    # variable inside the loops below is also named `clusters` (a list).
+    # Rename here to avoid shadowing.
+    save_clusters = clusters
 
     # Guard: density requires recentering
     if density and not recenter:
@@ -2580,11 +2691,13 @@ def cmd_aggr(
     typer.echo(f"[i] nproc              : {nproc}")
     typer.echo(f"[i] Recenter           : {recenter}")
     typer.echo(f"[i] Density            : {density}")
+    typer.echo(f"[i] Cluster details    : {save_clusters}")
 
     # Initialise output accumulators before either branch so the common output
     # section below is always guaranteed to find them defined.
     stats_data:       list = []   # list of (frame_number, monomers, clusters, max_size)
     density_profiles: list = []   # list of (r_bins, conc) — unified format for both paths
+    cluster_lines:    list = []   # list of (frame_number, line) — unified format for both paths
 
     # ------------------------------------------------------------------ #
     # Serial path  (nproc == 1)
@@ -2616,6 +2729,12 @@ def cmd_aggr(
                     typer.echo(
                         f"    monomers={monomer}  clusters={n_clusters}  largest={max_size}"
                     )
+
+                if save_clusters:
+                    cluster_lines.append((
+                        ts.frame,
+                        _format_clusters_line(ts.frame, clusters, sel_indices, u),
+                    ))
 
                 if recenter:
                     # Translate local cluster indices → universe-level segment
@@ -2678,20 +2797,24 @@ def cmd_aggr(
                     recenter, density, dr,
                     n_frames_avg, n_frames, start_rank, tmp,
                     sel_indices,          # universe-level indices for clustering
+                    save_clusters,        # whether to record cluster-details lines
                 )
                 futures[fut] = chunk
 
-            raw_stats:   list = []
-            raw_density: list = []
+            raw_stats:    list = []
+            raw_density:  list = []
+            raw_clusters: list = []
 
             for fut in as_completed(futures):
                 result = fut.result()
                 raw_stats.extend(result["stats_data"])
                 raw_density.extend(result["density_profiles"])
+                raw_clusters.extend(result["cluster_lines"])
 
         # Restore frame order — as_completed() returns in completion order,
         # not submission order.
-        stats_data = sorted(raw_stats, key=lambda x: x[0])
+        stats_data    = sorted(raw_stats, key=lambda x: x[0])
+        cluster_lines = sorted(raw_clusters, key=lambda x: x[0])
 
         # Merge per-worker XTC fragments in chunk order (== frame order).
         if recenter and tmp_paths:
@@ -2716,6 +2839,18 @@ def cmd_aggr(
         fh.write("# Frame  Monomers  Clusters  LargestClusterSize\n")
         for frame, monomer, n_clusters, max_size in stats_data:
             fh.write(f"{frame}  {monomer}  {n_clusters}  {max_size}\n")
+
+    if save_clusters and cluster_lines:
+        typer.echo(f"Writing cluster details -> {clusterdat}")
+        with open(clusterdat, "w") as fh:
+            fh.write("# frame | cluster sizes (largest-first) | counts per size | details\n")
+            fh.write(
+                "# details: size groups separated by '-'; within a size group, "
+                "multiple clusters separated by ';', segids within a cluster "
+                "comma-separated; monomers (size=1) are dash-joined directly.\n"
+            )
+            for _, line in cluster_lines:
+                fh.write(line + "\n")
 
     if density and density_profiles:
         # Truncate to the shortest profile before stacking.  r_max varies per
