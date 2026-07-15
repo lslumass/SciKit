@@ -4011,7 +4011,7 @@ def cmd_intracf(
 
 
 # =============================================================================
-#  ░░  RADIAL / SLAB NUMBER-DENSITY PROFILES (2D / 3D)  ░░
+#  11.  RADIAL / SLAB NUMBER-DENSITY PROFILES (2D / 3D)  ░░
 # =============================================================================
 #
 #  Known limitation
@@ -4020,7 +4020,9 @@ def cmd_intracf(
 #  If the reference group itself straddles a periodic boundary, its
 #  center_of_mass() / center_of_geometry() may be incorrect.  Make the
 #  reference molecule whole (e.g. with MDAnalysis.transformations) before
-#  running this command in that case.
+#  running this command in that case.  Use --ref-dist-out to diagnose this:
+#  if bead-to-center distances look anomalously large/inconsistent across
+#  frames, the reference group is likely not whole.
 #
 
 # Mapping from dimension label to coordinate axes indices
@@ -4094,16 +4096,13 @@ def _density_worker(args: tuple):
     u = mda.Universe(topology, trajectory)
 
     # ── Bin edges — must match cmd_density exactly ─────────────────────────
-    # Use n_bins*dr (not r_max) as the actual range so bin spacing is
-    # exactly dr regardless of floating-point rounding in r_max/dr.
     if slab:
-        # Symmetric around origin: [-half, +half] with half = n_bins*dr/2
         n_bins = int(round(2 * r_max / dr))
         half   = n_bins * dr / 2
         bins   = np.linspace(-half, half, n_bins + 1)
     else:
         n_bins    = int(round(r_max / dr))
-        rmax_eff  = n_bins * dr          # effective upper edge
+        rmax_eff  = n_bins * dr
         bins      = np.linspace(0.0, rmax_eff, n_bins + 1)
 
     # ── Atom selections ────────────────────────────────────────────────────
@@ -4158,20 +4157,15 @@ def _density_worker(args: tuple):
                 continue
 
             if slab:
-                # 1D signed displacement along the omitted axis
                 values = sel.positions[:, omitted_axis] - origin[omitted_axis]
-                # PBC minimum image on the omitted axis
                 if box is not None and box[omitted_axis] > 0:
                     L      = box[omitted_axis]
                     values -= L * np.round(values / L)
-
             else:
-                # 2D/3D displacement projected onto the selected axes
                 diff = sel.positions[:, axes] - origin[axes]
-                # PBC minimum image on each selected axis independently
                 if box is not None:
-                    box_axes = box[axes]          # lengths of the selected axes
-                    valid    = box_axes > 0        # guard against zero-length axes
+                    box_axes = box[axes]
+                    valid    = box_axes > 0
                     diff[:, valid] -= (
                         box_axes[valid]
                         * np.round(diff[:, valid] / box_axes[valid])
@@ -4185,6 +4179,92 @@ def _density_worker(args: tuple):
 
     typer.echo(f"  Worker {worker_id:02d}: {n_processed} frames processed")
     return n_processed, counts, area_sum
+
+
+def _ref_distance_worker(args: tuple):
+    """Subprocess worker: compute each bead's distance to the origin,
+    for a chunk of frames.
+
+    Mirrors the origin logic in `_density_worker`:
+
+    - ``ref_segids`` given: origin = ref group's center_of_mass()/
+      center_of_geometry() per frame; beads = the ref group's own atoms
+      (diagnoses whether the ref group is whole / straddling PBC).
+    - ``ref_segids`` is ``None``: origin = box center per frame;
+      beads = atoms matching *atom_names* (the --sel selection), i.e.
+      the same atoms being profiled in the density histograms.
+
+    PBC minimum-image convention is applied to the bead–origin
+    displacement on each axis independently.
+
+    Args:
+        args (tuple): packed tuple of:
+
+            - **topology**     (*str*)
+            - **trajectory**   (*str*)
+            - **frame_indices** (*list[int]*)
+            - **ref_segids**   (*Optional[list[str]]*) — None → box center
+            - **atom_names**   (*list[str]*) — used as bead group only
+              when ref_segids is None
+            - **use_mass**     (*bool*)
+            - **worker_id**    (*int*)
+
+    Returns:
+        tuple[list[int], list[str], np.ndarray]:
+            ``(frame_indices, bead_ids, distances)``, distances shape
+            ``(n_beads, len(frame_indices))``.
+    """
+    _suppress_warnings()
+    import MDAnalysis as mda
+
+    (topology, trajectory, frame_indices, ref_segids,
+     atom_names, use_mass, worker_id) = args
+
+    u = mda.Universe(topology, trajectory)
+
+    use_ref = ref_segids is not None
+    if use_ref:
+        bead_group = u.select_atoms("segid " + " ".join(ref_segids))
+        if len(bead_group) == 0:
+            raise ValueError(f"No atoms found in reference segments: {ref_segids}")
+    else:
+        bead_group = u.select_atoms(
+            " or ".join(f"name {n}" for n in atom_names)
+        )
+        if len(bead_group) == 0:
+            raise ValueError(f"No atoms found for --sel names: {atom_names}")
+
+    # Sequential bead labels 1..N in the bead group's original atom order.
+    n_beads   = len(bead_group)
+    bead_ids  = [str(i + 1) for i in range(n_beads)]
+    distances = np.zeros((n_beads, len(frame_indices)), dtype=np.float64)
+
+    for col, frame_idx in enumerate(frame_indices):
+        u.trajectory[frame_idx]
+        box = u.dimensions
+
+        if use_ref:
+            origin = (bead_group.center_of_mass() if use_mass
+                      else bead_group.center_of_geometry())
+        else:
+            if box is not None and box[0] > 0:
+                origin = box[:3] / 2.0
+            else:
+                raise ValueError(
+                    f"No --ref given and no valid box dimensions found at "
+                    f"frame {frame_idx}.  Cannot determine box center."
+                )
+
+        diff = bead_group.positions - origin
+        if box is not None:
+            L     = box[:3]
+            valid = L > 0
+            diff[:, valid] -= L[valid] * np.round(diff[:, valid] / L[valid])
+
+        distances[:, col] = np.linalg.norm(diff, axis=1)
+
+    typer.echo(f"  Worker {worker_id:02d}: {len(frame_indices)} frames processed")
+    return frame_indices, bead_ids, distances
 
 
 @app.command("density")
@@ -4256,6 +4336,19 @@ def cmd_density(
     nproc: Annotated[int, typer.Option(
         "--nproc", help="Number of parallel worker processes"
     )] = 4,
+    ref_dist_out: Annotated[Optional[str], typer.Option(
+        "--ref-dist-out",
+        help=(
+            "Write each bead's per-frame distance to the origin to this "
+            "file.  Format: bead_id,distance_frame<i>,...  "
+            "If --ref is given: beads = the ref group's atoms, origin = "
+            "ref group's COM/COG (diagnoses whether the ref group is "
+            "whole / straddling a PBC boundary).  "
+            "If --ref is omitted: beads = the --sel atoms, origin = box "
+            "center (mirrors the density command's own origin fallback).  "
+            "Pass an empty string ('') to skip writing this file."
+        ),
+    )] = "bead_distances.dat",
 ):
     """Calculate radial or slab **number-density profiles** (2D or 3D).
 
@@ -4282,7 +4375,7 @@ def cmd_density(
 
     Minimum-image convention is applied to atom–origin displacement vectors
     in all modes.  If the reference group straddles a periodic boundary, make
-    it whole before analysis.
+    it whole before analysis.  Use ``--ref-dist-out`` to diagnose this.
 
     **Origin (--ref)**
 
@@ -4304,12 +4397,18 @@ def cmd_density(
         stop (int): Last frame index; -1 = end.
         stride (int): Frame stride.
         nproc (int): Parallel worker processes.
+        ref_dist_out (Optional[str]): Bead-distance diagnostic output path;
+            "" disables it.
 
     Output:
         Space-separated columns written to ``<out>``::
 
             # r(A)  density_P  density_C   ...   (radial modes)
             # Z(A)  density_P  density_C   ...   (slab mode, --dimen xy)
+
+        If ``--ref-dist-out`` is set (default), a comma-separated file::
+
+            bead_id,distance_frame<i>,distance_frame<j>,...
 
     Examples::
 
@@ -4327,6 +4426,11 @@ def cmd_density(
         scical density --top conf.psf --traj system.xtc \\
             --sel P,C --ref R001 --dimen xy --slab \\
             --dr 2.0 --rmax 100 --out slab_z.dat --nproc 4
+
+        # Skip the bead-distance diagnostic file
+        scical density --top conf.psf --traj system.xtc \\
+            --sel M1 --dimen xyz --dr 3.0 --rmax 200 \\
+            --out density_3d.dat --ref-dist-out ""
     """
     _suppress_warnings()
     import MDAnalysis as mda
@@ -4510,7 +4614,6 @@ def cmd_density(
             results = pool.map(_density_worker, work_args)
 
     # ── Merge results from all workers ─────────────────────────────────────
-    # Bin edges computed with the same formula as in _density_worker.
     if slab:
         n_bins = int(round(2 * r_max / dr))
         half   = n_bins * dr / 2
@@ -4537,15 +4640,12 @@ def cmd_density(
     centres  = 0.5 * (r_inner + r_outer)
 
     if slab:
-        # Each slab bin has the same volume: avg_cross_section_area × dr
         avg_area   = total_area / total_frames
-        shell_norm = avg_area * dr          # scalar → broadcast over all bins
+        shell_norm = avg_area * dr
         typer.echo(f"[i] Avg cross-section area: {avg_area:.2f} A^2")
     elif is_3d:
-        # Spherical shell volume (A^3)
         shell_norm = (4.0 / 3.0) * np.pi * (r_outer**3 - r_inner**3)
     else:
-        # Annular ring area (A^2)
         shell_norm = np.pi * (r_outer**2 - r_inner**2)
 
     densities = {}
@@ -4579,6 +4679,53 @@ def cmd_density(
         f"{total_frames} frames, {mode_label}, {unit_label})"
     )
 
+    # ── Optional: per-bead distance-to-center diagnostic ───────────────────
+    if ref_dist_out:   # skip if empty string ("" = user opted out)
+        origin_desc = "ref-group center" if ref is not None else "box center"
+        typer.echo(
+            f"\n[i] Computing bead distances to {origin_desc} -> {ref_dist_out}"
+        )
+
+        dist_work_args = [
+            (top, traj, chunk, ref_segids, atom_names, use_mass, wid)
+            for wid, chunk in enumerate(chunks)   # reuse chunks from above
+        ]
+
+        if n_workers == 1:
+            dist_results = [_ref_distance_worker(dist_work_args[0])]
+        else:
+            with Pool(n_workers) as pool:
+                dist_results = pool.map(_ref_distance_worker, dist_work_args)
+
+        col_of_frame = {f: i for i, f in enumerate(frame_indices)}
+        bead_ids     = dist_results[0][1]
+        n_beads      = len(bead_ids)
+        distances    = np.zeros((n_beads, n_frames), dtype=np.float64)
+
+        for chunk_frames, chunk_bead_ids, chunk_dist in dist_results:
+            if chunk_bead_ids != bead_ids:
+                typer.echo(
+                    "[!] Internal error: bead ordering mismatch across "
+                    "workers.",
+                    err=True,
+                )
+                raise typer.Exit(1)
+            for local_col, frame_idx in enumerate(chunk_frames):
+                distances[:, col_of_frame[frame_idx]] = chunk_dist[:, local_col]
+
+        header = "bead_id," + ",".join(
+            f"distance_frame{f}" for f in frame_indices
+        )
+        with open(ref_dist_out, "w") as fh:
+            fh.write(header + "\n")
+            for i in range(n_beads):
+                row = ",".join(f"{d:.6f}" for d in distances[i])
+                fh.write(f"{i + 1},{row}\n")
+
+        typer.echo(
+            f"[+] Bead distances saved -> {ref_dist_out}  "
+            f"({n_beads} beads, {n_frames} frames, origin={origin_desc})"
+        )
     
                    
 # =============================================================================
