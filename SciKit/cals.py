@@ -330,7 +330,7 @@ def droplet(r, c):
 #  general fit function for fitting to get the fitted parameters and fitted curve with confidence interval
 # =============================================================================
 
-def general_fit(func, xs, ys, yerrs, xrange, p0=None, bounds=(-np.inf, np.inf), maxfev=10000):
+def general_fit(func, xs, ys, yerrs=None, xrange=None, p0=None, bounds=(-np.inf, np.inf), maxfev=10000):
     """
     Fit an arbitrary model function to data with uncertainties and compute the
     fitted curve along with a propagated confidence interval.
@@ -348,11 +348,14 @@ def general_fit(func, xs, ys, yerrs, xrange, p0=None, bounds=(-np.inf, np.inf), 
         Independent variable data points.
     ys : array-like
         Dependent variable data points.
-    yerrs : array-like
+    yerrs : array-like, optional
         Absolute uncertainties (standard deviations) on ys, used as weights
-        in the chi-squared minimization.
-    xrange : tuple of (float, float)
+        in the chi-squared minimization. Default is None, in which case
+        all points are weighted equally (unweighted least-squares fit) and
+        absolute_sigma is set to False.
+    xrange : tuple of (float, float), optional
         (x_min, x_max) range over which to evaluate the fitted curve.
+        Default is None, in which case the range of xs is used.
     p0 : array-like, optional
         Initial guesses for the fit parameters. Passed directly to
         scipy.optimize.curve_fit. Default is None (uses curve_fit defaults).
@@ -379,7 +382,17 @@ def general_fit(func, xs, ys, yerrs, xrange, p0=None, bounds=(-np.inf, np.inf), 
     """
     from scipy.optimize import curve_fit
 
-    params, cov = curve_fit(func, xs, ys, sigma=yerrs, absolute_sigma=True, p0=p0, bounds=bounds, maxfev=maxfev)
+    xs = np.asarray(xs)
+
+    if xrange is None:
+        xrange = (xs.min(), xs.max())
+
+    absolute_sigma = yerrs is not None
+
+    params, cov = curve_fit(
+        func, xs, ys, sigma=yerrs, absolute_sigma=absolute_sigma,
+        p0=p0, bounds=bounds, maxfev=maxfev
+    )
     perr = np.sqrt(np.diag(cov))
 
     xfit = np.linspace(xrange[0], xrange[1], 10000)
