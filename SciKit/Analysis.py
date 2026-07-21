@@ -2368,6 +2368,68 @@ def _radial_density(u, droplet_center: np.ndarray, ca_per_segment: int,
     return r_bins, concentration
 
 
+def _slab_density(u, droplet_center: np.ndarray, ca_per_segment: int,
+                   ref_atom: str, r_max: float, dr: float,
+                   omitted_axis: int, box: np.ndarray) -> tuple:
+    """Compute the 1-D slab monomer concentration profile for a flat (2D)
+    aggregate — e.g. a membrane-bound or interfacially confined slab.
+
+    Mirrors :func:`_radial_density`, but bins the *signed* displacement of
+    ``ref_atom`` positions along a single axis (the one *omitted* from the
+    plane of the slab) instead of the radial distance in 3-D.  Minimum-image
+    convention is applied along that axis so PBC-wrapped atoms are still
+    binned relative to the (possibly re-centred) droplet/slab centre.
+
+    Always operates on **all** atoms matching *ref_atom* in the universe.
+
+    Args:
+        u (MDAnalysis.Universe): Universe at the current (recentered) frame.
+        droplet_center (np.ndarray): 3-D Cartesian coordinates of the slab
+            centre, in ångström (typically the box centre after recentering).
+        ca_per_segment (int): Number of reference atoms per monomer.
+        ref_atom (str): Reference atom name (e.g. ``"CA"``).
+        r_max (float): Half-range of the profile, in ångström.  Bins span
+            ``[-r_max, +r_max]`` relative to *droplet_center*.
+        dr (float): Bin width, in ångström.
+        omitted_axis (int): Axis index (0=X, 1=Y, 2=Z) along which the
+            profile is computed — i.e. the axis normal to the slab plane.
+        box (np.ndarray): Current frame's box dimensions, shape ``(6,)``
+            (``[Lx, Ly, Lz, alpha, beta, gamma]``), used both for PBC
+            wrapping along *omitted_axis* and for the in-plane cross-section
+            area used to normalise counts into a volumetric concentration.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]:
+
+        - **r_bins** — Signed bin centres relative to *droplet_center* along
+          *omitted_axis*, shape ``(n_bins,)``, in ångström.
+        - **concentration** — Monomer concentration per slab bin, in mM.
+    """
+    all_ca = u.select_atoms(f"name {ref_atom}")
+    values = all_ca.positions[:, omitted_axis] - droplet_center[omitted_axis]
+
+    # Minimum-image wrap along the profiled axis only.
+    L = box[omitted_axis]
+    if L > 0:
+        values = values - L * np.round(values / L)
+
+    n_bins = int(round(2 * r_max / dr))
+    half   = n_bins * dr / 2.0
+    bins   = np.linspace(-half, half, n_bins + 1)
+    r_bins = 0.5 * (bins[:-1] + bins[1:])
+
+    ca_counts, _   = np.histogram(values, bins=bins)
+    monomer_counts = ca_counts / ca_per_segment
+
+    # In-plane cross-section area (product of the two non-omitted axes).
+    in_plane_axes = [ax for ax in range(3) if ax != omitted_axis]
+    area          = box[in_plane_axes[0]] * box[in_plane_axes[1]]
+    slab_vols     = area * dr
+    concentration = (monomer_counts / slab_vols) * (1e30 / AVOGADRO)
+
+    return r_bins, concentration
+
+
 # ---------------------------------------------------------------------------
 #  Parallel worker
 # ---------------------------------------------------------------------------
@@ -2388,6 +2450,8 @@ def _worker(
     tmp_traj: Optional[str],     # path for this worker's temporary XTC, or None
     sel_indices: list,           # universe-level segment indices used for clustering
     save_clusters: bool,         # whether to record per-frame cluster-details lines
+    slab: bool = False,          # slab (1D, flat-aggregate) density mode
+    omitted_axis: Optional[int] = None,  # axis index normal to the slab plane
 ) -> dict:
     """Analyse a contiguous subset of frames in a subprocess.
 
@@ -2396,7 +2460,7 @@ def _worker(
     trajectory index so that any start/stop/stride combination is handled
     correctly regardless of how frame numbers are stored in the XTC.
 
-    Clustering is restricted to *sel_indices*.  Recentering and radial density
+    Clustering is restricted to *sel_indices*.  Recentering and density
     always act on the **full** universe.
 
     Args:
@@ -2407,8 +2471,8 @@ def _worker(
         rcut (float): Clustering distance cutoff (Å).
         castep (int): Sub-sampling step for reference atoms.
         recenter (bool): Whether to unwrap and recenter the largest cluster.
-        density (bool): Whether to compute radial density profiles.
-        dr (float): Radial bin width (Å).
+        density (bool): Whether to compute density profiles (radial or slab).
+        dr (float): Radial/slab bin width (Å).
         n_frames_avg (int): Number of final frames to include in density avg.
         n_frames_total (int): Total analysed frames (all workers combined).
         chunk_start_rank (int): Global rank of this chunk's first frame.
@@ -2418,6 +2482,11 @@ def _worker(
             clustering.  Passed straight through to :func:`_grp_init`.
         save_clusters (bool): Whether to build a formatted cluster-details
             line for each frame (see :func:`_format_clusters_line`).
+        slab (bool): If ``True``, compute a 1-D slab density profile along
+            *omitted_axis* (via :func:`_slab_density`) instead of the default
+            3-D spherical radial profile (via :func:`_radial_density`).
+        omitted_axis (Optional[int]): Axis index (0=X, 1=Y, 2=Z) normal to
+            the slab plane.  Required when *slab* is ``True``.
 
     Returns:
         dict:
@@ -2484,16 +2553,29 @@ def _worker(
                 if density:
                     global_rank = chunk_start_rank + local_rank
                     if global_rank >= n_frames_total - n_frames_avg:
-                        r_max = float(np.min(box[:3]) / 2.0)
                         # ── Density: full universe ─────────────────────────
-                        r_bins, conc = _radial_density(
-                            u,
-                            droplet_center=box[:3] / 2.0,
-                            ca_per_segment=ca_per_segment,
-                            ref_atom=ref,
-                            r_max=r_max,
-                            dr=dr,
-                        )
+                        if slab:
+                            r_max = float(box[omitted_axis] / 2.0)
+                            r_bins, conc = _slab_density(
+                                u,
+                                droplet_center=box[:3] / 2.0,
+                                ca_per_segment=ca_per_segment,
+                                ref_atom=ref,
+                                r_max=r_max,
+                                dr=dr,
+                                omitted_axis=omitted_axis,
+                                box=box,
+                            )
+                        else:
+                            r_max = float(np.min(box[:3]) / 2.0)
+                            r_bins, conc = _radial_density(
+                                u,
+                                droplet_center=box[:3] / 2.0,
+                                ca_per_segment=ca_per_segment,
+                                ref_atom=ref,
+                                r_max=r_max,
+                                dr=dr,
+                            )
                         density_profiles.append((global_rank, r_bins, conc))
 
             stats_data.append((ts.frame, monomer, n_clusters, max_size))
@@ -2563,8 +2645,30 @@ def cmd_aggr(
     recenter: Annotated[bool, typer.Option("--recenter/--no-recenter",
               help="Unwrap & recenter the largest cluster each frame")] = False,
     density:  Annotated[bool, typer.Option("--density/--no-density",
-              help="Compute radial monomer concentration (requires --recenter)")] = False,
-    dr:           Annotated[float, typer.Option("--dr",           help="Radial bin width (Å)")] = 2.0,
+              help="Compute density profile — spherical or slab (requires --recenter)")] = False,
+    dimen:    Annotated[str, typer.Option(
+                  "--dimen",
+                  help=(
+                      "'xyz' (default) = 3D spherical droplet profile; "
+                      "'xy'/'xz'/'yz' = profile along the omitted axis when "
+                      "--slab is given (has no effect without --slab)."
+                  ),
+              )] = "xyz",
+    slab:     Annotated[bool, typer.Option(
+                  "--slab/--no-slab",
+                  help=(
+                      "Treat the aggregate as a flat **slab** (e.g. a "
+                      "membrane-bound or interfacially confined layer) "
+                      "instead of a 3D droplet.  Requires a 2D --dimen "
+                      "(xy, xz, or yz); profiles monomer concentration "
+                      "along the omitted axis, symmetric about the "
+                      "(recentered) box centre: -rmax … +rmax.  "
+                      "  --dimen xy --slab  →  profile along Z  "
+                      "  --dimen xz --slab  →  profile along Y  "
+                      "  --dimen yz --slab  →  profile along X"
+                  ),
+              )] = False,
+    dr:           Annotated[float, typer.Option("--dr",           help="Radial/slab bin width (Å)")] = 2.0,
     n_frames_avg: Annotated[int,   typer.Option("--n-frames-avg", help="Last N frames averaged for density profile")] = 50,
     nproc:        Annotated[int,   typer.Option("--nproc",        help="Number of parallel worker processes (1 = serial)")] = 1,
     sel:          Annotated[Optional[str], typer.Option(
@@ -2589,7 +2693,8 @@ def cmd_aggr(
                       help="Cluster-details output file",
                   )] = "cluster_details.dat",
 ):
-    """Analyse protein **aggregation**: cluster detection, PBC recentering, and radial density.
+    """Analyse protein **aggregation**: cluster detection, PBC recentering, and
+    radial *or slab* density.
 
     Processes each trajectory frame to:
 
@@ -2600,8 +2705,20 @@ def cmd_aggr(
        across PBC and translate it to the box centre; write as a new trajectory.
        Always applied to the **full** system.
     3. **Density profile** *(optional, ``--density``, requires ``--recenter``)* —
-       compute and average the radial monomer concentration (mM) over the last
+       compute and average the monomer concentration (mM) over the last
        ``--n-frames-avg`` frames.  Always computed from the **full** system.
+       Two profile modes are available, selected via ``--dimen``/``--slab``:
+
+       - **Spherical droplet** *(default, ``--dimen xyz``)* — radial monomer
+         concentration around the (recentered) box centre, normalised by
+         spherical shell volume.  Suited to a compact 3D droplet.
+       - **Flat slab** *(``--dimen xy|xz|yz --slab``)* — 1D monomer
+         concentration along the axis omitted from ``--dimen`` (i.e. normal
+         to the slab plane), symmetric about the box centre
+         (``-rmax … +rmax``), normalised by the average in-plane
+         cross-section area × ``--dr``.  Suited to a flat, membrane-like, or
+         interfacially confined aggregate that spans the box in two
+         dimensions.
 
     Parallelism is over frames (``--nproc``): each worker process handles a
     contiguous chunk of the trajectory and writes its own temporary XTC fragment,
@@ -2623,9 +2740,14 @@ def cmd_aggr(
         # Single segment
         scical aggr --top conf.psf --traj system.xtc --rcut 8.0 --sel R001
 
-        # 8 workers — with PBC recentering and radial density
+        # 8 workers — with PBC recentering and spherical droplet density
         scical aggr --top conf.psf --traj system.xtc --rcut 8.0 --sel R001-R099 \\
             --recenter --density --dr 2.0 --n-frames-avg 100 --nproc 8
+
+        # Flat slab (e.g. membrane-bound aggregate) — profile along Z
+        scical aggr --top conf.psf --traj system.xtc --rcut 8.0 --sel R001-R099 \\
+            --recenter --density --dimen xy --slab \\
+            --dr 2.0 --n-frames-avg 100 --nproc 8
     """
     _suppress_warnings()
     import MDAnalysis as mda
@@ -2639,6 +2761,38 @@ def cmd_aggr(
     if density and not recenter:
         typer.echo("[!] --density requires --recenter — density disabled.", err=True)
         density = False
+
+    # ── Validate --dimen / --slab (mirrors the `density` command) ──────────
+    dimen_lower = dimen.lower()
+    if dimen_lower not in _DIMEN_AXES:
+        typer.echo(
+            f"[!] Invalid --dimen '{dimen}'. Must be one of: xyz, xy, xz, yz.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    is_3d = len(_DIMEN_AXES[dimen_lower]) == 3
+
+    if slab and is_3d:
+        typer.echo(
+            "[!] --slab requires a 2D --dimen (xy, xz, or yz). "
+            "For --dimen xyz there is no omitted axis.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    if not slab and not is_3d:
+        typer.echo(
+            f"[!] --dimen {dimen_lower} without --slab is not supported for "
+            f"aggregation density — 2D in-plane profiles have no well-defined "
+            f"volumetric (mM) normalisation here. Add --slab for a slab "
+            f"profile along the omitted axis, or use --dimen xyz for the "
+            f"default spherical droplet profile.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    omitted_axis = _DIMEN_OMITTED.get(dimen_lower)  # None for xyz
 
     typer.echo("Loading trajectory...")
     u = _load_universe(top, traj)
@@ -2691,6 +2845,13 @@ def cmd_aggr(
     typer.echo(f"[i] nproc              : {nproc}")
     typer.echo(f"[i] Recenter           : {recenter}")
     typer.echo(f"[i] Density            : {density}")
+    if density:
+        axis_names = ["X", "Y", "Z"]
+        mode_label = (
+            f"slab along {axis_names[omitted_axis]}-axis"
+            if slab else "3D spherical droplet"
+        )
+        typer.echo(f"[i] Density mode       : {mode_label}")
     typer.echo(f"[i] Cluster details    : {save_clusters}")
 
     # Initialise output accumulators before either branch so the common output
@@ -2749,16 +2910,29 @@ def cmd_aggr(
                     writer.write(u.atoms)
 
                     if density and ts_idx >= n_frames - n_frames_avg:
-                        r_max = float(np.min(box[:3]) / 2.0)
                         # ── Density: full universe ──────────────────────────
-                        r_bins, conc = _radial_density(
-                            u,
-                            droplet_center=box[:3] / 2.0,
-                            ca_per_segment=ca_per_segment,
-                            ref_atom=ref,
-                            r_max=r_max,
-                            dr=dr,
-                        )
+                        if slab:
+                            r_max = float(box[omitted_axis] / 2.0)
+                            r_bins, conc = _slab_density(
+                                u,
+                                droplet_center=box[:3] / 2.0,
+                                ca_per_segment=ca_per_segment,
+                                ref_atom=ref,
+                                r_max=r_max,
+                                dr=dr,
+                                omitted_axis=omitted_axis,
+                                box=box,
+                            )
+                        else:
+                            r_max = float(np.min(box[:3]) / 2.0)
+                            r_bins, conc = _radial_density(
+                                u,
+                                droplet_center=box[:3] / 2.0,
+                                ca_per_segment=ca_per_segment,
+                                ref_atom=ref,
+                                r_max=r_max,
+                                dr=dr,
+                            )
                         density_profiles.append((r_bins, conc))
 
                 stats_data.append((ts.frame, monomer, n_clusters, max_size))
@@ -2798,6 +2972,8 @@ def cmd_aggr(
                     n_frames_avg, n_frames, start_rank, tmp,
                     sel_indices,          # universe-level indices for clustering
                     save_clusters,        # whether to record cluster-details lines
+                    slab,                 # slab (1D flat-aggregate) density mode
+                    omitted_axis,         # axis index normal to the slab plane
                 )
                 futures[fut] = chunk
 
@@ -2854,23 +3030,37 @@ def cmd_aggr(
 
     if density and density_profiles:
         # Truncate to the shortest profile before stacking.  r_max varies per
-        # frame (it is clipped to half the box side), so array lengths can
-        # differ by one bin between frames.
+        # frame (clipped to half the box side), so array lengths can differ by
+        # one bin between frames.
         min_len      = min(len(c) for _, c in density_profiles)
         r_bins_out   = density_profiles[0][0][:min_len]
         profiles_arr = np.array([c[:min_len] for _, c in density_profiles])
         avg_conc     = np.mean(profiles_arr, axis=0)
         std_conc     = np.std( profiles_arr, axis=0)
 
-        typer.echo(
-            f"Writing radial density profile ({len(density_profiles)} frames) -> {profile}"
-        )
-        with open(profile, "w") as fh:
-            fh.write(
+        if slab:
+            axis_names   = ["X", "Y", "Z"]
+            prof_label   = f"slab along {axis_names[omitted_axis]}-axis"
+            col1_label   = f"{axis_names[omitted_axis]}(A)"
+            header_desc  = (
+                f"# Slab monomer concentration along {axis_names[omitted_axis]}-axis "
+                f"averaged over last {len(density_profiles)} frames\n"
+            )
+        else:
+            prof_label   = "spherical droplet"
+            col1_label   = "Radius(A)"
+            header_desc  = (
                 f"# Radial monomer concentration averaged over last "
                 f"{len(density_profiles)} frames\n"
             )
-            fh.write("# Radius(A)  Concentration(mM)  StdDev(mM)\n")
+
+        typer.echo(
+            f"Writing {prof_label} density profile "
+            f"({len(density_profiles)} frames) -> {profile}"
+        )
+        with open(profile, "w") as fh:
+            fh.write(header_desc)
+            fh.write(f"# {col1_label}  Concentration(mM)  StdDev(mM)\n")
             for r, c, s in zip(r_bins_out, avg_conc, std_conc):
                 fh.write(f"{r:.3f}  {c:.6f}  {s:.6f}\n")
 

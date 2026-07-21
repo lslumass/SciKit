@@ -367,18 +367,41 @@ def general_fit(func, xs, ys, yerrs=None, xrange=None, p0=None, bounds=(-np.inf,
 
     Returns
     -------
-    dict with keys:
-        params : ndarray
-            Best-fit parameter values.
-        perr : ndarray
-            Standard errors of the fitted parameters (sqrt of covariance
-            diagonal).
-        xfit : ndarray
-            10000 evenly spaced x values spanning xrange.
-        yfit : ndarray
-            Model evaluated at xfit with the best-fit parameters.
-        yfit_err : ndarray
-            1-sigma confidence band on yfit from error propagation.
+    result : dict
+        Dictionary with the following keys. Access each item by key, e.g.
+        ``result["params"]`` or via unpacking, e.g.
+        ``params, perr, xfit, yfit, yfit_err = result.values()``
+        (only safe if you keep the key order shown below intact).
+
+        params : ndarray, shape (n_params,)
+            Best-fit parameter values, in the same order as the arguments
+            of ``func`` (excluding x). E.g. ``a_fit, b_fit = result["params"]``
+            for a two-parameter model.
+        perr : ndarray, shape (n_params,)
+            Standard errors (1-sigma) of the fitted parameters, i.e.
+            ``np.sqrt(np.diag(cov))``, in the same order as ``params``.
+            E.g. ``a_err, b_err = result["perr"]``.
+        xfit : ndarray, shape (10000,)
+            Evenly spaced x values spanning ``xrange``, for plotting the
+            fitted curve: ``plt.plot(result["xfit"], result["yfit"])``.
+        yfit : ndarray, shape (10000,)
+            Model evaluated at ``xfit`` using the best-fit ``params``, i.e.
+            ``func(xfit, *params)``.
+        yfit_err : ndarray, shape (10000,)
+            1-sigma confidence band on ``yfit`` at each point in ``xfit``,
+            from Jacobian error propagation. Use for plotting the band:
+            ``plt.fill_between(result["xfit"], result["yfit"] - result["yfit_err"],
+            result["yfit"] + result["yfit_err"], alpha=0.3)``.
+
+    Examples
+    --------
+    >>> result = general_fit(model, xs, ys, yerrs=yerrs)
+    >>> params = result["params"]
+    >>> perr = result["perr"]
+    >>> xfit, yfit, yfit_err = result["xfit"], result["yfit"], result["yfit_err"]
+    >>> plt.errorbar(xs, ys, yerr=yerrs, fmt="o")
+    >>> plt.plot(xfit, yfit, label="best fit")
+    >>> plt.fill_between(xfit, yfit - yfit_err, yfit + yfit_err, alpha=0.3)
     """
     from scipy.optimize import curve_fit
 
