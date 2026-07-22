@@ -132,16 +132,17 @@ def _msd_worker(args: tuple):
     Args:
         args (tuple): A packed argument tuple containing:
 
-            - **segid** (*str*) — Segment identifier (e.g. ``"PROA"``).
+            - **segid** (*str*) — Segment identifier (e.g. ``"R001"``).
             - **topology** (*str*) — Path to the topology file.
             - **trajectory** (*str*) — Path to the trajectory file.
+            - **ref** (*str*) — Reference atom name (e.g. ``"CA"``, ``"P"``).
             - **resid_range** (*Optional[str]*) — Residue range string
-              (e.g. ``"1:38"``), or ``None`` for the full segment.
+              (e.g. ``"1:38"``), or ``None`` for all residues in the segment.
             - **start** (*int*) — Index of the first frame to analyse.
             - **stop** (*int*) — Index of the last frame (``-1`` = end).
             - **stride** (*int*) — Step between analysed frames.
             - **outdir** (*str*) — Directory where output files are written.
-            - **per_residue** (*bool*) — Whether to write per-Cα MSD files.
+            - **per_atom** (*bool*) — Whether to write per-atom MSD files.
             - **max_tau** (*Optional[float]*) — Maximum lag time in ps;
               ``None`` keeps all lag times.
 
@@ -154,20 +155,21 @@ def _msd_worker(args: tuple):
     Output files:
         - ``<outdir>/<segid>_msd.dat`` — Two-column file: lag time (ps) and
           total MSD (Å²).
-        - ``<outdir>/<segid>_CA_msd.dat`` — Per-Cα MSD file (only when
-          *per_residue* is ``True``).
+        - ``<outdir>/<segid>_<ref>_msd.dat`` — Per-atom MSD file (only when
+          *per_atom* is ``True``).
     """
     _suppress_warnings()
     import MDAnalysis as mda
     import MDAnalysis.analysis.msd as msd_mod
 
-    segid, topology, trajectory, resid_range, \
-        start, stop, stride, outdir, per_residue, max_tau = args
+    segid, topology, trajectory, ref, resid_range, \
+        start, stop, stride, outdir, per_atom, max_tau = args
 
     u = mda.Universe(topology, trajectory)
 
-    selection = (f"name CA and segid {segid} and resid {resid_range}"
-                 if resid_range else f"name CA and segid {segid}")
+    selection = f"name {ref} and segid {segid}"
+    if resid_range:
+        selection += f" and resid {resid_range}"
 
     ag = u.select_atoms(selection)
     if len(ag) == 0:
@@ -182,7 +184,7 @@ def _msd_worker(args: tuple):
     msds     = MSD.results.timeseries
 
     if max_tau is not None:
-        mask    = lagtimes <= max_tau
+        mask     = lagtimes <= max_tau
         lagtimes = lagtimes[mask]
         msds     = msds[mask]
 
@@ -195,19 +197,19 @@ def _msd_worker(args: tuple):
         fmt=f"%{W}.6f",
     )
 
-    if per_residue:
-        msds_by_res = MSD.results.msds_by_particle
+    if per_atom:
+        msds_by_atom = MSD.results.msds_by_particle   # shape (n_lagtimes, n_atoms)
         if max_tau is not None:
-            msds_by_res = msds_by_res[mask]  
-        resids      = ag.resids
-        W2          = 14
-        header_res  = " ".join(
+            msds_by_atom = msds_by_atom[mask]
+        resids  = ag.resids                            # always populated; matches original
+        W2      = 14
+        header_atom = " ".join(
             [f"{'lag_time(ps)':>{W2 - 2}}"] + [f"{r:>{W2}}" for r in resids]
         )
         np.savetxt(
-            os.path.join(outdir, f"{segid}_CA_msd.dat"),
-            np.column_stack((lagtimes, msds_by_res)),
-            header=header_res,
+            os.path.join(outdir, f"{segid}_{ref}_msd.dat"),
+            np.column_stack((lagtimes, msds_by_atom)),
+            header=header_atom,
             fmt=[f"%{W2}.6f"] * (1 + len(resids)),
         )
 
@@ -216,80 +218,123 @@ def _msd_worker(args: tuple):
 
 @app.command("msd")
 def cmd_msd(
-    top: Annotated[str, typer.Option("--top", help="Topology file")] = "conf.psf",
-    traj: Annotated[str, typer.Option("--traj", help="Trajectory file")] = "system.xtc",
-    resid: Annotated[Optional[str], typer.Option("--resid", help="Residue range e.g. '1:38'")] = None,
-    outdir: Annotated[str, typer.Option("--outdir", help="Output directory")] = "./diffusion",
-    start: Annotated[int, typer.Option("--start", help="First frame index")] = 0,
-    stop: Annotated[int, typer.Option("--stop", help="Last frame index; -1=end")] = -1,
-    stride: Annotated[int, typer.Option("--stride", help="Frame stride")] = 1,
-    per_residue: Annotated[bool, typer.Option("--per-residue/--no-per-residue",
-                                               help="Write per-Cα MSD files")] = False,
-    max_tau: Annotated[Optional[float], typer.Option("--max-tau",
-                                                      help="Maximum lag time (ps); "
-                                                           "limits frames loaded, not just output")] = None,
-    nproc: Annotated[int, typer.Option("--nproc", help="Parallel workers")] = 4,
+    top:       Annotated[str, typer.Option("--top",  help="Topology file")]   = "conf.psf",
+    traj:      Annotated[str, typer.Option("--traj", help="Trajectory file")] = "system.xtc",
+    sel:       Annotated[Optional[str], typer.Option(
+                   "--sel",
+                   help=(
+                       "Segment selection: single id ('R001'), range ('R001-R010'), "
+                       "or comma-separated mix ('R001-R099,K001-K010').  "
+                       "Omit to use all segments that contain --ref atoms."
+                   ),
+               )] = None,
+    ref:       Annotated[str, typer.Option(
+                   "--ref",
+                   help="Reference atom name for MSD (e.g. 'CA' for proteins, 'P' for lipids).",
+               )] = "CA",
+    resid:     Annotated[Optional[str], typer.Option("--resid", help="Residue range e.g. '1:38'")] = None,
+    outdir:    Annotated[str,  typer.Option("--outdir",   help="Output directory")]          = "./diffusion",
+    start:     Annotated[int,  typer.Option("--start",    help="First frame index")]          = 0,
+    stop:      Annotated[int,  typer.Option("--stop",     help="Last frame index; -1=end")]   = -1,
+    stride:    Annotated[int,  typer.Option("--stride",   help="Frame stride")]               = 1,
+    per_atom:  Annotated[bool, typer.Option("--per-atom/--no-per-atom",
+                                             help="Write per-atom MSD file for each segment")] = False,
+    max_tau:   Annotated[Optional[float], typer.Option(
+                   "--max-tau",
+                   help="Maximum lag time (ps); truncates output, not frames read.",
+               )] = None,
+    nproc:     Annotated[int,  typer.Option("--nproc",    help="Parallel workers")]           = 4,
 ):
-    """Calculate per-segment Cα **mean squared displacement** (FFT method).
+    """Calculate per-segment **mean squared displacement** (FFT method).
 
-    Iterates over all segments in the topology that contain matching Cα atoms
-    and dispatches each segment to a subprocess worker.  The MSD is computed
-    via the Einstein relation using MDAnalysis' ``EinsteinMSD`` with FFT
-    acceleration.
+    Dispatches one subprocess worker per segment.  The MSD is computed via the
+    Einstein relation using MDAnalysis' ``EinsteinMSD`` with FFT acceleration.
+    The reference atom type (``--ref``) and the segment subset (``--sel``) are
+    both user-configurable, making this command suitable for proteins (``--ref
+    CA``), lipids (``--ref P``), nucleic acids, or any coarse-grained system.
 
     Args:
         top (str): Path to the topology file (PSF, PDB, GRO, …).
         traj (str): Path to the trajectory file (XTC, DCD, …).
-        resid (Optional[str]): Residue range to restrict the Cα selection,
-            e.g. ``"1:38"``.  When omitted the full segment is used.
+        sel (Optional[str]): Segment selection string.  Accepts a single id
+            (``"R001"``), a range (``"R001-R099"``), or a comma-separated mix
+            (``"R001-R099,K001-K010"``).  When omitted, every segment that
+            contains at least one ``--ref`` atom is included.
+        ref (str): Atom name used as the MSD reference
+            (``"CA"`` for proteins, ``"P"`` for lipid/nucleic phosphate, etc.).
+        resid (Optional[str]): Further restrict the selection to a residue
+            range, e.g. ``"1:38"``.  Applied on top of ``--sel`` and ``--ref``.
         outdir (str): Output directory; created automatically if absent.
         start (int): Index of the first trajectory frame to include.
         stop (int): Index of the last trajectory frame; ``-1`` means end.
         stride (int): Step between analysed frames.
-        per_residue (bool): When ``True``, also write per-Cα MSD files.
-        max_tau (Optional[float]): Truncate the analysis at this lag time
-            (ps) by limiting the number of frames passed to ``EinsteinMSD``.
-            The maximum achievable lag equals ``(n_frames - 1) × dt``, so
-            only ``ceil(max_tau / dt) + 1`` frames are ever read from disk.
-            ``None`` (default) uses all available frames.
+        per_atom (bool): When ``True``, also write per-atom MSD files.
+        max_tau (Optional[float]): Truncate output at this lag time (ps).
+            ``None`` (default) uses all available lag times.
         nproc (int): Number of parallel worker processes.
 
     Output:
         ``<outdir>/<segid>_msd.dat`` — two columns: lag time (ps) and MSD (Å²).
-        ``<outdir>/<segid>_CA_msd.dat`` — per-Cα MSD table (``--per-residue`` only).
+        ``<outdir>/<segid>_<ref>_msd.dat`` — per-atom MSD table (``--per-atom`` only).
 
     Example::
 
-            scical msd --top conf.psf --traj system.xtc --resid 1:50 \\
-                       --max-tau 5000 --outdir ./msd_results --nproc 8
+        # Protein backbone Cα, selected segments only
+        scical msd --top conf.psf --traj system.xtc \\
+            --sel R001-R099 --ref CA --outdir ./msd_ca --nproc 8
+
+        # Lipid phosphate MSD, all L segments
+        scical msd --top mem.psf --traj mem.xtc \\
+            --sel L001-L240 --ref P --outdir ./msd_p --nproc 8
     """
     _suppress_warnings()
     import MDAnalysis as mda
 
     os.makedirs(outdir, exist_ok=True)
 
-    u = mda.Universe(top, traj)
-    segments = [
-        seg for seg in u.segments
-        if len(seg.atoms.select_atoms(
-            f"name CA{' and resid ' + resid if resid else ''}"
-        )) > 0
-    ]
-    if not segments:
-        typer.echo("[!] No matching segments found.", err=True)
+    u = _load_universe(top, traj)
+
+    # ── Resolve segment selection ────────────────────────────────────────────
+    if sel is not None:
+        try:
+            sel_indices = _parse_sel(sel, u)
+        except ValueError as exc:
+            typer.echo(f"[!] {exc}", err=True)
+            raise typer.Exit(1)
+        segids = [u.segments[i].segid for i in sel_indices]
+    else:
+        # Fall back: all segments that contain at least one --ref atom.
+        resid_clause = f" and resid {resid}" if resid else ""
+        segids = [
+            seg.segid for seg in u.segments
+            if len(seg.atoms.select_atoms(f"name {ref}{resid_clause}")) > 0
+        ]
+
+    if not segids:
+        typer.echo(
+            f"[!] No segments found with 'name {ref}'"
+            + (f" and resid {resid}" if resid else "") + ".",
+            err=True,
+        )
         raise typer.Exit(1)
 
-    segids = [seg.segid for seg in segments]
+    # ── Validate --ref atoms exist ───────────────────────────────────────────
+    probe = u.select_atoms(f"name {ref}")
+    if len(probe) == 0:
+        typer.echo(f"[!] No atoms named '{ref}' found in topology. Check --ref.", err=True)
+        raise typer.Exit(1)
+
     typer.echo(f"[i] Segments    : {segids}")
-    typer.echo(f"[i] Region      : {'resid ' + resid if resid else 'full protein'}")
+    typer.echo(f"[i] Ref atom    : {ref}")
+    typer.echo(f"[i] Region      : {'resid ' + resid if resid else 'full segment'}")
     typer.echo(f"[i] Frames      : start={start} stop={stop} stride={stride}")
-    typer.echo(f"[i] Per-residue : {per_residue}")
+    typer.echo(f"[i] Per-atom    : {per_atom}")
     typer.echo(f"[i] Max tau     : {f'{max_tau} ps' if max_tau is not None else 'all'}")
     typer.echo(f"[i] Output dir  : {outdir}")
     del u
 
     args_list = [
-        (segid, top, traj, resid, start, stop, stride, outdir, per_residue, max_tau)
+        (segid, top, traj, ref, resid, start, stop, stride, outdir, per_atom, max_tau)
         for segid in segids
     ]
 
