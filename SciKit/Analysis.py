@@ -5346,6 +5346,15 @@ def cmd_saxs(
     start: Annotated[int, typer.Option("--start", help="First frame index")] = 0,
     stop: Annotated[int, typer.Option("--stop", help="Last frame index; -1=end")] = -1,
     stride: Annotated[int, typer.Option("--stride", help="Frame stride")] = 1,
+    mode: Annotated[str, typer.Option(
+        "--mode",
+        help=(
+            "Calculation mode: 'segment' computes a separate SAXS profile "
+            "for each segment individually (default); 'system' computes a "
+            "single SAXS profile for the whole system (all selected atoms "
+            "as one unit)."
+        ),
+    )] = "segment",
     pepsi_bin: Annotated[str, typer.Option(
         "--pepsi-bin", help="Path to the Pepsi-SAXS executable"
     )] = "Pepsi-SAXS",
@@ -5359,12 +5368,18 @@ def cmd_saxs(
     )] = None,
     nproc: Annotated[int, typer.Option("--nproc", help="Parallel workers")] = 4,
 ):
-    """Compute per-segment **SAXS profiles** averaged over trajectory frames using Pepsi-SAXS.
+    """Compute **SAXS profiles** averaged over trajectory frames using Pepsi-SAXS.
 
-    For each selected segment, extracts per-frame PDB structures, invokes
-    the Pepsi-SAXS external tool to compute I(q), and averages the resulting
-    profiles over all analysed frames.  Results for all segments are written
-    to a single output file with columns: q, S(q) per segment.
+    Supports two modes of operation controlled by ``--mode``:
+
+    - **segment** (default): For each selected segment, extracts per-frame PDB
+      structures, invokes Pepsi-SAXS, and averages the resulting I(q) profiles
+      over all analysed frames.  Output contains one column per segment.
+
+    - **system**: Treats all selected atoms (across all selected segments) as a
+      single unit. Extracts one PDB per frame containing the entire selection,
+      invokes Pepsi-SAXS, and averages over frames.  Output contains a single
+      I(q) column.
 
     Dependencies
     ------------
@@ -5394,21 +5409,14 @@ def cmd_saxs(
     Pipeline
     --------
     1. Load the topology and trajectory with MDAnalysis.
-    2. For **every** selected segment, iterate the trajectory and write each
-       analysed frame as a temporary PDB file (serial, performed once).
-    3. Collect all PDB files from all segments into a single global task list.
-    4. Distribute that task list evenly across ``--nproc`` workers.
-    5. Each worker runs Pepsi-SAXS on its assigned PDBs (segment-agnostic).
-    6. Collect results, group by segment, average I(q) per segment.
-    7. Delete all temporary files.
+    2. Depending on ``--mode``:
 
-    Parallelisation strategy:
+       - *segment*: For every selected segment, write per-frame PDBs, run
+         Pepsi-SAXS in parallel, and average per segment.
+       - *system*: Write one PDB per frame for the entire selection, run
+         Pepsi-SAXS in parallel, and average into a single profile.
 
-    - PDB writing is serial (MDAnalysis trajectory iteration is single-threaded).
-    - Pepsi-SAXS invocations are the expensive step and are fully parallelised.
-    - A single ``Pool(nproc)`` is created once, all tasks from all segments
-      are distributed evenly — no idle workers regardless of the segment/frame
-      ratio.
+    3. Delete all temporary files.
 
     Args:
         top (str): Path to the topology file (PSF, PDB, GRO, …).
@@ -5421,6 +5429,8 @@ def cmd_saxs(
         start (int): Index of the first trajectory frame to include.
         stop (int): Index of the last trajectory frame; ``-1`` means end.
         stride (int): Step between analysed frames.
+        mode (str): Calculation mode — ``"segment"`` for per-segment profiles
+            or ``"system"`` for a single whole-system profile.
         pepsi_bin (str): Path or name of the Pepsi-SAXS executable.  If not
             an absolute path, it must be discoverable via the system PATH.
             Download from: https://team.inria.fr/nano-d/software/pepsi-saxs/
@@ -5431,37 +5441,54 @@ def cmd_saxs(
             When provided, Pepsi-SAXS performs a chi-squared fit against the
             experimental curve (produces ``.fit`` output with scaled
             intensities).  Omit for theoretical profile only.
-        nproc (int): Number of parallel worker processes.  All PDB files from
-            all segments are pooled and distributed evenly — workers stay
-            maximally busy regardless of segment count.
+        nproc (int): Number of parallel worker processes.  All PDB files are
+            pooled and distributed evenly — workers stay maximally busy.
 
     Output:
-        ``<out>`` — space-separated columns::
+        Depending on ``--mode``:
+
+        - *segment*::
 
             # q          sq_<segid1>      sq_<segid2>      ...
 
+        - *system*::
+
+            # q          sq_system
+
         The first column is the wavevector q in the units output by
         Pepsi-SAXS (typically Å⁻¹).  Subsequent columns are the
-        frame-averaged scattering intensity I(q) for each segment.
+        frame-averaged scattering intensity I(q).
 
     Example::
 
-        # All segments, every 10th frame
+        # Per-segment (default), every 10th frame
         scical saxs --top conf.psf --traj system.dcd --stride 10 --nproc 8
+
+        # Whole-system SAXS profile
+        scical saxs --top conf.psf --traj system.dcd --mode system --nproc 8
 
         # Selected segments with custom Pepsi-SAXS path and options
         scical saxs --top conf.psf --traj system.dcd --sel R001-R010 \\
             --pepsi-bin /opt/Pepsi-SAXS/Pepsi-SAXS \\
             --pepsi-args "--dro 0.03 --r0 1.1" --out saxs.dat --nproc 4
 
-        # Fit against experimental data
-        scical saxs --top conf.psf --traj system.dcd --sel R001 \\
+        # Fit against experimental data (whole system)
+        scical saxs --top conf.psf --traj system.dcd --mode system \\
             --exp-data experiment.dat --out saxs_fit.dat
     """
     _suppress_warnings()
     import MDAnalysis as mda
     import shutil as _shutil
     import tempfile
+
+    # ── Validate mode ──────────────────────────────────────────────────────
+    mode = mode.lower().strip()
+    if mode not in ("segment", "system"):
+        typer.echo(
+            f"[!] Invalid --mode '{mode}'. Must be 'segment' or 'system'.",
+            err=True,
+        )
+        raise typer.Exit(1)
 
     # ── Verify Pepsi-SAXS is available ─────────────────────────────────────
     if os.path.isabs(pepsi_bin):
@@ -5505,6 +5532,7 @@ def cmd_saxs(
 
     typer.echo(f"[i] Topology    : {top}")
     typer.echo(f"[i] Trajectory  : {traj}")
+    typer.echo(f"[i] Mode        : {mode}")
     typer.echo(f"[i] Segments    : {segids}")
     typer.echo(f"[i] Frames      : start={start} stop={stop} stride={stride}")
     typer.echo(f"[i] Pepsi-SAXS  : {pepsi_bin}")
@@ -5513,7 +5541,7 @@ def cmd_saxs(
     typer.echo(f"[i] Workers     : {nproc}")
     typer.echo(f"[i] Output      : {out}")
 
-    # ── Step 1: Write all PDBs for all segments (serial, once) ─────────────
+    # ── Step 1: Write all PDBs (serial, once) ──────────────────────────────
     tmp_root = tempfile.mkdtemp(prefix="saxs_all_")
 
     try:
@@ -5522,46 +5550,67 @@ def cmd_saxs(
         os.makedirs(frames_dir, exist_ok=True)
         os.makedirs(profiles_dir, exist_ok=True)
 
-        # Build atom selections per segment
-        selections = {}
-        for segid in segids:
-            ag = u.select_atoms(f"segid {segid}")
-            if len(ag) == 0:
-                typer.echo(f"  [!] Segment {segid}: no atoms — skipping.", err=True)
-            else:
-                selections[segid] = ag
+        fitting = exp_data is not None
+        out_ext = ".fit" if fitting else ".dat"
 
-        if not selections:
-            typer.echo("[!] No atoms found in any selected segment.", err=True)
-            raise typer.Exit(1)
-
-        # Global task list: (segid, pdb_path, out_path) for every segment × frame
+        # Global task list: (segid, pdb_path, out_path) for every task
         global_tasks = []
 
-        typer.echo(f"\n[i] Writing PDB frames...")
-        for ts in u.trajectory[start:effective_stop:stride]:
-            for segid, ag in selections.items():
+        if mode == "system":
+            # ── SYSTEM MODE: all selected atoms as a single unit ───────────
+            sel_string = " or ".join(f"segid {s}" for s in segids)
+            ag = u.select_atoms(sel_string)
+
+            if len(ag) == 0:
+                typer.echo("[!] No atoms found in the selected segments.", err=True)
+                raise typer.Exit(1)
+
+            typer.echo(f"\n[i] Writing PDB frames (whole system, {len(ag)} atoms)...")
+            for ts in u.trajectory[start:effective_stop:stride]:
                 pdb_path = os.path.join(
-                    frames_dir, f"{segid}_frame_{ts.frame:06d}.pdb"
+                    frames_dir, f"system_frame_{ts.frame:06d}.pdb"
                 )
                 ag.write(pdb_path)
 
-                fitting = exp_data is not None
-                out_ext = ".fit" if fitting else ".dat"
                 prof_path = os.path.join(
-                    profiles_dir, f"{segid}_frame_{ts.frame:06d}{out_ext}"
+                    profiles_dir, f"system_frame_{ts.frame:06d}{out_ext}"
                 )
-                global_tasks.append((segid, pdb_path, prof_path))
+                global_tasks.append(("system", pdb_path, prof_path))
+
+        else:
+            # ── SEGMENT MODE: one PDB per segment per frame ────────────────
+            selections = {}
+            for segid in segids:
+                ag = u.select_atoms(f"segid {segid}")
+                if len(ag) == 0:
+                    typer.echo(f"  [!] Segment {segid}: no atoms — skipping.", err=True)
+                else:
+                    selections[segid] = ag
+
+            if not selections:
+                typer.echo("[!] No atoms found in any selected segment.", err=True)
+                raise typer.Exit(1)
+
+            typer.echo(f"\n[i] Writing PDB frames (per-segment)...")
+            for ts in u.trajectory[start:effective_stop:stride]:
+                for segid, ag in selections.items():
+                    pdb_path = os.path.join(
+                        frames_dir, f"{segid}_frame_{ts.frame:06d}.pdb"
+                    )
+                    ag.write(pdb_path)
+
+                    prof_path = os.path.join(
+                        profiles_dir, f"{segid}_frame_{ts.frame:06d}{out_ext}"
+                    )
+                    global_tasks.append((segid, pdb_path, prof_path))
 
         n_total_tasks = len(global_tasks)
-        n_frames_written = n_total_tasks // len(selections)
 
         if n_total_tasks == 0:
             typer.echo("[!] No PDB frames written — check frame range.", err=True)
             raise typer.Exit(1)
 
-        typer.echo(f"[i] Total PDBs  : {n_total_tasks} "
-                   f"({len(selections)} segments × {n_frames_written} frames)")
+        typer.echo(f"[i] Total PDBs  : {n_total_tasks}")
 
         del u  # Free memory before spawning workers
 
@@ -5583,7 +5632,7 @@ def cmd_saxs(
             with Pool(n_workers) as pool:
                 all_results = pool.map(_saxs_pepsi_worker, worker_args)
 
-        # ── Step 3: Group results by segment and average ───────────────────
+        # ── Step 3: Group results by segment/label and average ─────────────
         from collections import defaultdict
         seg_profiles = defaultdict(list)
 
@@ -5592,18 +5641,23 @@ def cmd_saxs(
                 if entry is not None:
                     seg_profiles[segid].append(entry)
 
-        # ── Step 4: Compute per-segment averages ───────────────────────────
-        valid_segids = []
+        # ── Step 4: Compute averages ───────────────────────────────────────
+        valid_labels = []
         valid_q = None
         valid_profiles = []
 
-        for segid in segids:  # preserve original ordering
-            profiles = seg_profiles.get(segid, [])
+        if mode == "system":
+            labels_to_process = ["system"]
+        else:
+            labels_to_process = segids  # preserve original ordering
+
+        for label in labels_to_process:
+            profiles = seg_profiles.get(label, [])
             if not profiles:
-                typer.echo(f"  [!] Segment {segid}: no valid profiles — excluded.")
+                typer.echo(f"  [!] {label}: no valid profiles — excluded.")
                 continue
 
-            # Validate consistent q-grid within this segment
+            # Validate consistent q-grid
             ref_q = profiles[0][0]
             consistent_I = []
             for q, I in profiles:
@@ -5611,26 +5665,24 @@ def cmd_saxs(
                     consistent_I.append(I)
 
             if not consistent_I:
-                typer.echo(f"  [!] Segment {segid}: inconsistent q-grids — excluded.")
+                typer.echo(f"  [!] {label}: inconsistent q-grids — excluded.")
                 continue
 
             mean_I = np.array(consistent_I).mean(axis=0)
-            std_I = np.array(consistent_I).std(axis=0)
 
-            # Cross-segment q-grid consistency check
             if valid_q is None:
                 valid_q = ref_q
             elif len(ref_q) != len(valid_q):
                 typer.echo(
-                    f"  [!] Segment {segid}: q-grid length mismatch "
+                    f"  [!] {label}: q-grid length mismatch "
                     f"({len(ref_q)} vs {len(valid_q)}) — excluded.",
                     err=True,
                 )
                 continue
 
-            valid_segids.append(segid)
+            valid_labels.append(label)
             valid_profiles.append(mean_I)
-            typer.echo(f"  [+] Segment {segid}: {len(consistent_I)} frames averaged")
+            typer.echo(f"  [+] {label}: {len(consistent_I)} frames averaged")
 
         if not valid_profiles:
             typer.echo("[!] No valid SAXS profiles obtained — nothing written.", err=True)
@@ -5640,16 +5692,16 @@ def cmd_saxs(
         data = np.column_stack([valid_q] + valid_profiles)
         W = 16
         header = " ".join(
-            [f"{'q':>{W - 2}}"] + [f"{'sq_' + s:>{W}}" for s in valid_segids]
+            [f"{'q':>{W - 2}}"] + [f"{'sq_' + s:>{W}}" for s in valid_labels]
         )
         np.savetxt(
             out, data,
             header=header,
-            fmt=[f"%{W}.8e"] * (1 + len(valid_segids)),
+            fmt=[f"%{W}.8e"] * (1 + len(valid_labels)),
         )
 
         typer.echo(f"\n[+] SAXS profiles saved -> {out}  "
-                   f"({len(valid_segids)} segments, {len(valid_q)} q-points)")
+                   f"({len(valid_labels)} profile(s), {len(valid_q)} q-points)")
 
     finally:
         # ── Step 6: Clean up ALL temporary files ───────────────────────────
