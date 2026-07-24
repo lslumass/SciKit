@@ -357,7 +357,7 @@ def color_cycle(id):
     return colors.get(id, '#000000')
 
 
-def savefig(fig, filename):
+def savefig(fig, filename, *args, **kwargs):
     """
     Save a figure to disk at publication-quality resolution.
 
@@ -379,7 +379,7 @@ def savefig(fig, filename):
     >>> fig, axs = general_temp(1, 2, 10, 4)
     >>> savefig(fig, 'results/figure1.png')
     """
-    fig.savefig(filename, dpi=600, bbox_inches='tight')
+    fig.savefig(filename, dpi=600, bbox_inches='tight', *args, **kwargs)
 
 
 def insert_image(ax, image_path, x, y, zoom=1.0, rotation=0):
