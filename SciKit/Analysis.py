@@ -428,79 +428,102 @@ def _parse_seg_selection(sel_str: str, available_segids: list[str]) -> list[str]
 
 
 def _rg_worker(args: tuple):
-    """Subprocess worker: compute radius-of-gyration time series for one segment.
+    """Subprocess worker: compute Rg for ALL segments over a chunk of frames.
 
-    Selects protein atoms (and optionally a residue sub-range) in the given
-    segment and evaluates ``AtomGroup.radius_of_gyration()`` frame by frame.
+    Each worker handles a contiguous slice of trajectory frames and computes
+    Rg for every segment in a single trajectory pass — one Universe open,
+    one set of AtomGroups, one read per frame.
+
+    This is fundamentally different from the old per-segment strategy (one
+    worker per segment, each reading the full trajectory).  With 500 segments
+    the old approach opened 500 Universes simultaneously and read the
+    trajectory 500 times; this approach opens exactly ``nproc`` Universes
+    total and reads the trajectory once across all workers combined.
 
     Args:
         args (tuple): A packed argument tuple containing:
 
-            - **segid** (*str*) — Segment identifier.
             - **topology** (*str*) — Path to the topology file.
             - **trajectory** (*str*) — Path to the trajectory file.
-            - **resid_range** (*Optional[str]*) — Residue range string, or
-              ``None`` for the full protein segment.
-            - **start** (*int*) — First frame index.
-            - **stop** (*int*) — Last frame index (``-1`` = end).
-            - **stride** (*int*) — Frame stride.
+            - **segids** (*list[str]*) — All segment ids to compute Rg for.
+            - **resid_range** (*Optional[str]*) — Residue range, or ``None``
+              for full segments.
+            - **frame_indices** (*list[int]*) — Absolute trajectory frame
+              indices assigned to this worker.
 
     Returns:
-        tuple[str, Optional[np.ndarray]]: A ``(segid, rg_array)`` pair, where
-        *rg_array* has shape ``(n_frames,)`` in ångström units.
-        Returns ``(segid, None)`` if no atoms matched or the trajectory slice
-        is empty.
+        dict[str, list[float]]: Maps each segid to its list of Rg values
+        (one per frame in *frame_indices*, in ångström).
     """
     _suppress_warnings()
     import MDAnalysis as mda
 
-    segid, topology, trajectory, resid_range, start, stop, stride = args
+    topology, trajectory, segids, resid_range, frame_indices = args
+
     u   = mda.Universe(topology, trajectory)
-    sel = u.select_atoms(
-        f"segid {segid} and resid {resid_range}"
-        if resid_range else f"segid {segid}"
-    )
 
-    if len(sel.atoms) == 0:
-        return segid, None
+    # Build one AtomGroup per segment — done once, reused every frame.
+    selections = {}
+    for segid in segids:
+        sel_str = (f"segid {segid} and resid {resid_range}"
+                   if resid_range else f"segid {segid}")
+        ag = u.select_atoms(sel_str)
+        if len(ag.atoms) > 0:
+            selections[segid] = ag
 
-    rg = [sel.radius_of_gyration()
-          for _ts in u.trajectory[start:_traj_stop(stop):stride]]
+    if not selections:
+        return {}
 
-    if not rg:
-        return segid, None
+    # Accumulate Rg per segment across this worker's frames.
+    results = {segid: [] for segid in selections}
+    for frame_idx in frame_indices:
+        u.trajectory[frame_idx]
+        for segid, ag in selections.items():
+            results[segid].append(ag.radius_of_gyration())
 
-    typer.echo(f"  [+] Segment {segid}: {len(rg)} frames")
-    return segid, np.array(rg)
+    return results
 
 
 @app.command("rg")
 def cmd_rg(
-    top: Annotated[str, typer.Option("--top")] = "conf.psf",
-    traj: Annotated[str, typer.Option("--traj")] = "system.xtc",
-    sel: Annotated[Optional[str], typer.Option("--sel", help="Segment selection (e.g. R001, R001-R010, or R001,R003-R006)")] = None,
-    resid: Annotated[Optional[str], typer.Option("--resid", help="Residue range")] = None,
-    out: Annotated[str, typer.Option("--out", help="Output file")] = "rg.dat",
-    start: Annotated[int, typer.Option("--start")] = 0,
-    stop: Annotated[int, typer.Option("--stop")] = -1,
+    top:    Annotated[str, typer.Option("--top")]    = "conf.psf",
+    traj:   Annotated[str, typer.Option("--traj")]   = "system.xtc",
+    sel:    Annotated[Optional[str], typer.Option(
+                "--sel",
+                help="Segment selection (e.g. R001, R001-R010, or R001,R003-R006,R010)."
+                     " Omit to use all segments.",
+            )] = None,
+    resid:  Annotated[Optional[str], typer.Option("--resid", help="Residue range e.g. '1:100'")] = None,
+    out:    Annotated[str, typer.Option("--out",    help="Output file")] = "rg.dat",
+    start:  Annotated[int, typer.Option("--start")]  = 0,
+    stop:   Annotated[int, typer.Option("--stop")]   = -1,
     stride: Annotated[int, typer.Option("--stride")] = 10,
-    nproc: Annotated[int, typer.Option("--nproc")] = 4,
+    nproc:  Annotated[int, typer.Option("--nproc")]  = 4,
 ):
     """Calculate per-segment **radius of gyration** time series.
 
-    Computes Rg(t) for every protein-containing segment in parallel and writes
-    a single multi-column ``.dat`` file with one column per segment, indexed
-    by frame number.
+    Computes Rg(t) for every segment in ``--sel`` and writes a single
+    multi-column ``.dat`` file (one column per segment, indexed by frame).
+
+    Parallelism strategy
+    --------------------
+    Workers are parallelised **over frames**, not over segments.  Each worker
+    receives the full segment list and a disjoint subset of frame indices, opens
+    one Universe, builds one AtomGroup per segment, and iterates only its own
+    frames.  This means:
+
+    - Exactly ``nproc`` Universes are open simultaneously (not one per segment).
+    - The trajectory is read once in total across all workers combined.
+    - Memory scales with ``nproc × n_atoms_per_frame``, not with ``n_segments``.
+
+    This makes the command suitable for large systems (e.g. 500 segments,
+    100 frames, 40 workers) without OOM risk.
 
     Args:
         top (str): Path to the topology file.
         traj (str): Path to the trajectory file.
-        sel (Optional[str]): Segment selection expression. Accepts a single
-            segment (``"R001"``), a range (``"R001-R010"``), or a
-            comma-separated combination (``"R001,R003-R006,R010"``).
-            Omit to use all segments.
-        resid (Optional[str]): Residue range to restrict the selection
-            (e.g. ``"1:100"``).  Omit to use the full protein.
+        sel (Optional[str]): Segment selection string.
+        resid (Optional[str]): Residue range to restrict the selection.
         out (str): Path for the output ``.dat`` file.
         start (int): Index of the first trajectory frame.
         stop (int): Index of the last trajectory frame; ``-1`` means end.
@@ -513,55 +536,100 @@ def cmd_rg(
 
     Example::
 
-            scical rg --top conf.psf --traj system.xtc --sel R001-R010 --out rg.dat --stride 5 --nproc 4
+        scical rg --top conf.psf --traj system.xtc --sel R001-R500 \\
+            --out rg.dat --stride 1 --nproc 40
     """
     _suppress_warnings()
-    import MDAnalysis as mda
 
-    u = mda.Universe(top, traj)
-    segments = [
-        seg for seg in u.segments
-        if len(seg.atoms.select_atoms(
-            f"resid {resid}" if resid else "all"
-        )) > 0
-    ]
-    if not segments:
-        typer.echo("[!] No matching protein segments found.", err=True)
+    u = _load_universe(top, traj)
+
+    # ── Resolve segment selection ────────────────────────────────────────────
+    try:
+        sel_indices = _parse_sel(sel, u)
+    except ValueError as exc:
+        typer.echo(f"[!] {exc}", err=True)
         raise typer.Exit(1)
 
-    segids = [seg.segid for seg in segments]
+    segids = [u.segments[i].segid for i in sel_indices]
 
-    # --- Apply --sel filter ---
-    if sel:
-        segids = _parse_seg_selection(sel, segids)
-        if not segids:
-            typer.echo(f"[!] No segments match selection: '{sel}'", err=True)
-            raise typer.Exit(1)
+    if not segids:
+        typer.echo("[!] No segments found.", err=True)
+        raise typer.Exit(1)
 
-    typer.echo(f"[i] Segments : {segids}")
+    # ── Resolve frame indices ────────────────────────────────────────────────
+    effective_stop = _traj_stop(stop)
+    all_frame_indices = list(
+        range(*slice(start, effective_stop, stride).indices(len(u.trajectory)))
+    )
+
+    if not all_frame_indices:
+        typer.echo("[!] No frames in the specified range.", err=True)
+        raise typer.Exit(1)
+
+    n_frames  = len(all_frame_indices)
+    n_workers = min(nproc, n_frames)
+
+    typer.echo(f"[i] Segments : {len(segids)} ({segids[0]} … {segids[-1]})")
     typer.echo(f"[i] Region   : {'resid ' + resid if resid else 'all'}")
+    typer.echo(f"[i] Frames   : {n_frames} (indices {all_frame_indices[0]}…{all_frame_indices[-1]})")
+    typer.echo(f"[i] Workers  : {n_workers} (frame-parallel)")
+    del u
 
-    with Pool(nproc) as pool:
-        results = pool.map(
-            _rg_worker,
-            [(s, top, traj, resid, start, stop, stride) for s in segids],
-        )
+    # ── Distribute frames across workers ─────────────────────────────────────
+    # Round-robin split: worker i gets frames [i, i+n_workers, i+2*n_workers, …]
+    chunks = [all_frame_indices[i::n_workers] for i in range(n_workers)]
+    worker_args = [
+        (top, traj, segids, resid, chunk)
+        for chunk in chunks
+    ]
 
-    valid_segids, rg_all = [], []
-    for segid, rg in results:
-        if rg is not None:
-            valid_segids.append(segid)
-            rg_all.append(rg)
+    # ── Dispatch ─────────────────────────────────────────────────────────────
+    if n_workers == 1:
+        all_results = [_rg_worker(worker_args[0])]
+    else:
+        with Pool(n_workers) as pool:
+            all_results = pool.map(_rg_worker, worker_args)
 
-    if not rg_all:
+    # ── Merge: reconstruct per-segment time series in frame order ───────────
+    # Each worker returns {segid: [rg, rg, …]} for its own frames.
+    # Frames are interleaved (round-robin), so we reconstruct by interleaving.
+    merged: dict = {segid: [] for segid in segids}
+    for worker_result in all_results:
+        for segid, rg_list in worker_result.items():
+            merged[segid].extend(rg_list)
+
+    # Sort each segment's values back into frame order by interleaving chunks.
+    # Worker 0 has frames [0, n_workers, 2*n_workers, …]
+    # Worker 1 has frames [1, n_workers+1, …]  etc.
+    # Interleaved reconstruction: zip the per-worker lists and flatten.
+    per_worker_lists = {
+        segid: [all_results[w].get(segid, []) for w in range(n_workers)]
+        for segid in segids
+    }
+    ordered: dict = {}
+    for segid in segids:
+        lists = per_worker_lists[segid]
+        # max length across workers for this segid
+        max_len = max((len(l) for l in lists), default=0)
+        interleaved = []
+        for frame_slot in range(max_len):
+            for worker_list in lists:
+                if frame_slot < len(worker_list):
+                    interleaved.append(worker_list[frame_slot])
+        ordered[segid] = interleaved
+
+    valid_segids = [s for s in segids if ordered[s]]
+    if not valid_segids:
         typer.echo("[!] No valid results — nothing written.", err=True)
         return
 
-    min_len  = min(len(r) for r in rg_all)
-    rg_all   = [r[:min_len] for r in rg_all]
-    data     = np.column_stack([np.arange(min_len)] + rg_all)
-    W        = 14
-    header   = " ".join(
+    rg_all  = [np.array(ordered[s]) for s in valid_segids]
+    min_len = min(len(r) for r in rg_all)
+    rg_all  = [r[:min_len] for r in rg_all]
+
+    data   = np.column_stack([np.arange(min_len)] + rg_all)
+    W      = 14
+    header = " ".join(
         [f"{'frame':>{W - 2}}"] + [f"{s:>{W}}" for s in valid_segids]
     )
     np.savetxt(out, data, header=header,
@@ -569,64 +637,72 @@ def cmd_rg(
     typer.echo(f"[+] Rg saved -> {out}  ({len(valid_segids)} segments, {min_len} frames)")
 
 
+
+
 # =============================================================================
 #  ░░  3.  DSSP  ░░
 # =============================================================================
 
 def _dssp_worker(args: tuple):
-    """Subprocess worker: run DSSP secondary-structure assignment for one segment.
+    """Subprocess worker: run DSSP for ALL segments over a chunk of frames.
 
-    Uses ``MDAnalysis.analysis.dssp.DSSP`` to assign secondary structure
-    codes (``'H'`` = α-helix, ``'E'`` = β-strand, ``'C'`` = coil) to each
-    residue for every frame, then computes the per-residue helicity and
-    β-sheet occupancy as fractions over the analysed trajectory window.
+    Each worker handles a disjoint subset of frame indices and computes DSSP
+    for every segment via a single ``DSSP.run(frames=chunk)`` call per segment.
+    Raw per-residue H and E counts are returned so the parent can sum across
+    workers and divide by total frame count to get occupancy fractions.
+
+    Returning integer counts means partial results from different workers
+    combine exactly by addition with no averaging artefacts from unequal
+    chunk sizes.
 
     Args:
         args (tuple): A packed argument tuple containing:
 
-            - **segid** (*str*) — Segment identifier.
-            - **topology** (*str*) — Path to the topology file.
-            - **trajectory** (*str*) — Path to the trajectory file.
-            - **start** (*int*) — First frame index.
-            - **stop** (*int*) — Last frame index (``-1`` = end).
-            - **stride** (*int*) — Frame stride.
+            - **topology** (*str*) -- Path to the topology file.
+            - **trajectory** (*str*) -- Path to the trajectory file.
+            - **segids** (*list[str]*) -- All segment ids to process.
+            - **frame_indices** (*list[int]*) -- Absolute trajectory frame
+              indices assigned to this worker.
 
     Returns:
-        tuple: ``(segid, resids, helicity, beta)`` where:
+        dict[str, dict]: Keyed by segid; each value is a dict with:
 
-        - **segid** (*str*) — The processed segment identifier.
-        - **resids** (*np.ndarray | None*) — 1-D array of residue IDs, or
-          ``None`` if no protein residues were found or no frames were analysed.
-        - **helicity** (*np.ndarray | None*) — Per-residue helix fraction in
-          ``[0, 1]``, shape ``(n_residues,)``.
-        - **beta** (*np.ndarray | None*) — Per-residue β-strand fraction in
-          ``[0, 1]``, shape ``(n_residues,)``.
+            - ``'resids'``   (*np.ndarray*) -- 1-D array of residue ids.
+            - ``'H_counts'`` (*np.ndarray[int]*) -- Per-residue helix count.
+            - ``'E_counts'`` (*np.ndarray[int]*) -- Per-residue beta count.
+            - ``'n_frames'`` (*int*) -- Number of frames processed.
+
+        Segments with no protein residues are omitted from the dict.
     """
     _suppress_warnings()
     import MDAnalysis as mda
     from MDAnalysis.analysis.dssp import DSSP
 
-    segid, topology, trajectory, start, stop, stride = args
-    u   = mda.Universe(topology, trajectory)
-    sel = u.select_atoms(f"segid {segid} and protein")
+    topology, trajectory, segids, frame_indices = args
 
-    if len(sel.residues) == 0:
-        return segid, None, None, None
+    u = mda.Universe(topology, trajectory)
 
-    dssp = DSSP(sel)
-    dssp.run(start=start, stop=_traj_stop(stop), step=stride)
-    codes = dssp.results.dssp        # (n_frames, n_residues)
-    n_frames, _ = codes.shape
+    result = {}
+    for segid in segids:
+        sel = u.select_atoms(f"segid {segid} and protein")
+        if len(sel.residues) == 0:
+            continue
 
-    if n_frames == 0:
-        return segid, None, None, None
+        dssp = DSSP(sel)
+        dssp.run(frames=frame_indices)          # non-contiguous frame list
+        codes = dssp.results.dssp               # (n_chunk_frames, n_residues)
 
-    helicity = np.sum(codes == "H", axis=0) / n_frames
-    beta     = np.sum(codes == "E", axis=0) / n_frames
-    resids   = sel.residues.resids.copy()
+        if codes.shape[0] == 0:
+            continue
 
-    typer.echo(f"  [+] Segment {segid}: {len(resids)} residues, {n_frames} frames")
-    return segid, resids, helicity, beta
+        result[segid] = {
+            "resids":   sel.residues.resids.copy(),
+            "H_counts": np.sum(codes == "H", axis=0).astype(np.int64),
+            "E_counts": np.sum(codes == "E", axis=0).astype(np.int64),
+            "n_frames": codes.shape[0],
+        }
+
+    return result
 
 
 def _write_dssp_dat(output_file, all_resids, values_by_seg, segids):
@@ -663,81 +739,158 @@ def _write_dssp_dat(output_file, all_resids, values_by_seg, segids):
     data = np.column_stack([all_res_sorted.astype(float), mat])
     np.savetxt(output_file, data, header=header,
                fmt=[f"%{W}.0f"] + [f"%{W}.6f"] * n_seg)
-    typer.echo(f"  [✓] Saved {output_file}  ({n_res} residues, {n_seg} segments)")
+    typer.echo(f"  [+] Saved {output_file}  ({n_res} residues, {n_seg} segments)")
 
 
 @app.command("dssp")
 def cmd_dssp(
-    top: Annotated[str, typer.Option("--top")] = "conf.psf",
-    traj: Annotated[str, typer.Option("--traj")] = "system.xtc",
-    hout: Annotated[str, typer.Option("--hout", help="Helicity output file")] = "helicity.dat",
-    bout: Annotated[str, typer.Option("--bout", help="Beta-sheet output file")] = "beta.dat",
-    start: Annotated[int, typer.Option("--start")] = 0,
-    stop: Annotated[int, typer.Option("--stop")] = -1,
+    top:    Annotated[str, typer.Option("--top")]    = "conf.psf",
+    traj:   Annotated[str, typer.Option("--traj")]   = "system.xtc",
+    sel:    Annotated[Optional[str], typer.Option(
+                "--sel",
+                help=(
+                    "Segment selection (e.g. R001, R001-R010, or R001,R003-R006,R010). "
+                    "Omit to use all protein segments."
+                ),
+            )] = None,
+    hout:   Annotated[str, typer.Option("--hout",   help="Helicity output file")]   = "helicity.dat",
+    bout:   Annotated[str, typer.Option("--bout",   help="Beta-sheet output file")] = "beta.dat",
+    start:  Annotated[int, typer.Option("--start")]  = 0,
+    stop:   Annotated[int, typer.Option("--stop")]   = -1,
     stride: Annotated[int, typer.Option("--stride")] = 10,
-    nproc: Annotated[int, typer.Option("--nproc")] = 4,
+    nproc:  Annotated[int, typer.Option("--nproc")]  = 4,
 ):
     """Calculate per-residue **DSSP** helicity and beta-sheet content.
 
     Assigns DSSP secondary-structure codes to every protein residue in every
-    analysed frame using MDAnalysis' built-in DSSP implementation.
-    Per-residue fractions are averaged over time and written to two separate
-    files — one for helicity (``'H'`` codes) and one for β-sheet content
-    (``'E'`` codes).
+    analysed frame.  Per-residue fractions are averaged over time and written
+    to two separate files -- one for helicity (H codes) and one for beta-sheet
+    content (E codes).
+
+    Parallelism strategy
+    --------------------
+    Workers are parallelised over frames, not over segments -- identical to
+    the rg command.  Each worker receives the full segment list and a disjoint
+    subset of frame indices, then calls DSSP(sel).run(frames=chunk) once per
+    segment.  Workers return raw H/E integer counts; the parent sums them
+    across workers and divides by total frames to produce occupancy fractions.
+
+    Exactly nproc Universes are open simultaneously regardless of segment
+    count, eliminating the OOM issue of the old per-segment design.
 
     Args:
         top (str): Path to the topology file.
         traj (str): Path to the trajectory file.
+        sel (Optional[str]): Segment selection string.  Omit for all protein
+            segments.
         hout (str): Output path for the per-residue helicity table.
-        bout (str): Output path for the per-residue β-sheet table.
+        bout (str): Output path for the per-residue beta-sheet table.
         start (int): Index of the first trajectory frame.
-        stop (int): Index of the last trajectory frame; ``-1`` means end.
+        stop (int): Index of the last trajectory frame; -1 means end.
         stride (int): Step between analysed frames.
         nproc (int): Number of parallel worker processes.
 
     Output:
-        ``<hout>`` and ``<bout>`` — space-separated tables:
-        ``residue  <segid1>  <segid2>  …``
-        Values are per-residue helix / β-strand occupancy fractions in [0, 1].
+        hout and bout -- space-separated tables:
+        residue  segid1  segid2  ...
+        Values are per-residue helix / beta-strand occupancy fractions in [0, 1].
 
     Example::
 
-            scical dssp --top conf.psf --traj system.xtc --hout helicity.dat --bout beta.dat --stride 10 --nproc 4
+        scical dssp --top conf.psf --traj system.xtc --sel R001-R500 \\
+            --hout helicity.dat --bout beta.dat --stride 10 --nproc 40
     """
     _suppress_warnings()
-    import MDAnalysis as mda
 
-    u        = mda.Universe(top, traj)
-    segments = [seg for seg in u.segments
-                if len(seg.atoms.select_atoms("protein")) > 0]
-    if not segments:
+    u = _load_universe(top, traj)
+
+    # Resolve segment selection
+    if sel is not None:
+        try:
+            sel_indices = _parse_sel(sel, u)
+        except ValueError as exc:
+            typer.echo(f"[!] {exc}", err=True)
+            raise typer.Exit(1)
+        segids = [u.segments[i].segid for i in sel_indices]
+    else:
+        segids = [
+            seg.segid for seg in u.segments
+            if len(seg.atoms.select_atoms("protein")) > 0
+        ]
+
+    if not segids:
         typer.echo("[!] No protein segments found.", err=True)
         raise typer.Exit(1)
 
-    segids = [seg.segid for seg in segments]
-    typer.echo(f"[i] Segments : {segids}")
+    # Resolve frame indices
+    effective_stop    = _traj_stop(stop)
+    all_frame_indices = list(
+        range(*slice(start, effective_stop, stride).indices(len(u.trajectory)))
+    )
 
-    with Pool(nproc) as pool:
-        results = pool.map(
-            _dssp_worker,
-            [(s, top, traj, start, stop, stride) for s in segids],
-        )
+    if not all_frame_indices:
+        typer.echo("[!] No frames in the specified range.", err=True)
+        raise typer.Exit(1)
 
+    n_frames  = len(all_frame_indices)
+    n_workers = min(nproc, n_frames)
+
+    typer.echo(f"[i] Segments : {len(segids)} ({segids[0]} ... {segids[-1]})")
+    typer.echo(f"[i] Frames   : {n_frames} "
+               f"(indices {all_frame_indices[0]}...{all_frame_indices[-1]})")
+    typer.echo(f"[i] Workers  : {n_workers} (frame-parallel)")
+    del u
+
+    # Distribute frames round-robin across workers
+    chunks      = [all_frame_indices[i::n_workers] for i in range(n_workers)]
+    worker_args = [(top, traj, segids, chunk) for chunk in chunks]
+
+    if n_workers == 1:
+        all_results = [_dssp_worker(worker_args[0])]
+    else:
+        with Pool(n_workers) as pool:
+            all_results = pool.map(_dssp_worker, worker_args)
+
+    # Merge: sum H/E counts across workers per segment
+    merged_H:      dict = {}
+    merged_E:      dict = {}
+    merged_resids: dict = {}
+    total_frames:  dict = {}
+
+    for worker_result in all_results:
+        for segid, data in worker_result.items():
+            if segid not in merged_H:
+                merged_H[segid]      = data["H_counts"].copy()
+                merged_E[segid]      = data["E_counts"].copy()
+                merged_resids[segid] = data["resids"]
+                total_frames[segid]  = data["n_frames"]
+            else:
+                merged_H[segid]     += data["H_counts"]
+                merged_E[segid]     += data["E_counts"]
+                total_frames[segid] += data["n_frames"]
+
+    # Convert counts to fractions and assemble output
     valid_segids   = []
     helicity_pairs = []
     beta_pairs     = []
     all_resids     = []
 
-    for segid, resids, helicity, beta in results:
-        if resids is None:
+    for segid in segids:   # preserve --sel ordering
+        if segid not in merged_H or total_frames.get(segid, 0) == 0:
+            typer.echo(f"  [!] Segment {segid}: no frames processed -- skipped.", err=True)
             continue
+        n   = total_frames[segid]
+        hel = merged_H[segid] / n
+        bet = merged_E[segid] / n
+        res = merged_resids[segid]
         valid_segids.append(segid)
-        helicity_pairs.append((resids, helicity))
-        beta_pairs.append((resids, beta))
-        all_resids.extend(resids.tolist())
+        helicity_pairs.append((res, hel))
+        beta_pairs.append((res, bet))
+        all_resids.extend(res.tolist())
+        typer.echo(f"  [+] Segment {segid}: {len(res)} residues, {n} frames")
 
     if not valid_segids:
-        typer.echo("[!] No valid results — nothing written.", err=True)
+        typer.echo("[!] No valid results -- nothing written.", err=True)
         return
 
     _write_dssp_dat(hout, all_resids, helicity_pairs, valid_segids)
