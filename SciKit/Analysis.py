@@ -591,31 +591,24 @@ def cmd_rg(
             all_results = pool.map(_rg_worker, worker_args)
 
     # ── Merge: reconstruct per-segment time series in frame order ───────────
-    # Each worker returns {segid: [rg, rg, …]} for its own frames.
-    # Frames are interleaved (round-robin), so we reconstruct by interleaving.
-    merged: dict = {segid: [] for segid in segids}
-    for worker_result in all_results:
-        for segid, rg_list in worker_result.items():
-            merged[segid].extend(rg_list)
-
-    # Sort each segment's values back into frame order by interleaving chunks.
-    # Worker 0 has frames [0, n_workers, 2*n_workers, …]
-    # Worker 1 has frames [1, n_workers+1, …]  etc.
-    # Interleaved reconstruction: zip the per-worker lists and flatten.
+    # Frames are distributed round-robin: worker i owns frames
+    # [i, i+n_workers, i+2*n_workers, …].
+    # To restore chronological order we interleave the per-worker lists:
+    # frame_slot 0 → worker0[0], worker1[0], worker2[0], …
+    # frame_slot 1 → worker0[1], worker1[1], …  etc.
     per_worker_lists = {
         segid: [all_results[w].get(segid, []) for w in range(n_workers)]
         for segid in segids
     }
     ordered: dict = {}
     for segid in segids:
-        lists = per_worker_lists[segid]
-        # max length across workers for this segid
+        lists   = per_worker_lists[segid]
         max_len = max((len(l) for l in lists), default=0)
         interleaved = []
         for frame_slot in range(max_len):
-            for worker_list in lists:
-                if frame_slot < len(worker_list):
-                    interleaved.append(worker_list[frame_slot])
+            for wl in lists:
+                if frame_slot < len(wl):
+                    interleaved.append(wl[frame_slot])
         ordered[segid] = interleaved
 
     valid_segids = [s for s in segids if ordered[s]]
