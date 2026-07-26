@@ -2252,9 +2252,17 @@ def _grp_init(u, ref_atom: str = "CA", step: int = 1,
     index, which is what :func:`_recenter_frame` and :func:`_unwrap_cluster`
     expect.
 
+    *ref_atom* may be a comma-separated list of atom names (e.g. ``"CA,P"``).
+    Each segment is matched against **all** names; the first name that yields
+    at least one atom is used for that segment.  This allows a single
+    ``--ref CA,P`` to handle mixed protein + nucleic-acid systems where
+    proteins expose ``CA`` and nucleic acids / lipids expose ``P``.
+
     Args:
         u (MDAnalysis.Universe): Loaded Universe.
-        ref_atom (str): Name of the reference atom (default: ``"CA"``).
+        ref_atom (str): Comma-separated reference atom name(s).
+            Single name: ``"CA"`` (proteins) or ``"P"`` (nucleic / lipid).
+            Multiple names: ``"CA,P"`` (mixed system).
         step (int): Sub-sampling step applied within each segment's reference
             atoms.
         sel_indices (Optional[list[int]]): Universe-level segment indices to
@@ -2272,16 +2280,27 @@ def _grp_init(u, ref_atom: str = "CA", step: int = 1,
     if sel_indices is None:
         sel_indices = list(range(len(u.segments)))
 
+    # Support comma-separated atom names for mixed systems.
+    ref_names = [n.strip() for n in ref_atom.split(",") if n.strip()]
+
     segs, grps = [], []
-    empty: list = []                         # segment indices with no ref atoms
+    empty: list = []
     for i, seg_idx in enumerate(sel_indices):
         segid = u.segments[seg_idx].segid
-        cas   = u.select_atoms(f"segid {segid} and name {ref_atom}")
-        seg   = cas[::step].atoms.select_atoms(f"name {ref_atom}")
-        if len(seg) == 0:
+
+        # Try each ref name in order; use the first that gives atoms.
+        seg = None
+        for name in ref_names:
+            cas = u.select_atoms(f"segid {segid} and name {name}")
+            if len(cas) > 0:
+                seg = cas[::step]   # subsample; already filtered to 'name {name}'
+                break
+
+        if seg is None or len(seg) == 0:
             empty.append(seg_idx)
-        segs.append(seg)
-        grps.append(i)
+        else:
+            segs.append(seg)
+            grps.append(i)
 
     if empty:
         n_empty      = len(empty)
@@ -2292,7 +2311,7 @@ def _grp_init(u, ref_atom: str = "CA", step: int = 1,
             f"atoms named '{ref_atom}' (segids: {sample_names}"
             f"{'…' if n_empty > 5 else ''}).\n"
             f"  • Check --ref (current: '{ref_atom}'). For proteins use 'CA'; "
-            f"for nucleic acids / lipids use 'P'.\n"
+            f"for nucleic acids / lipids use 'P'; for mixed systems use 'CA,P'.\n"
             f"  • Check --sel: the selected range may include the wrong molecule type."
         )
 
@@ -2521,20 +2540,30 @@ def _recenter_frame(u, largest_cluster: list, box: np.ndarray) -> np.ndarray:
 #  Radial density
 # ---------------------------------------------------------------------------
 
-def _radial_density(u, droplet_center: np.ndarray, ca_per_segment: int,
+def _radial_density(u, droplet_center: np.ndarray,
                     ref_atom: str = "CA",
+                    ref_counts: Optional[dict] = None,
                     r_max: float = 100.0, dr: float = 1.0) -> tuple:
     """Compute the radial monomer concentration profile centred on a droplet.
 
     Always operates on **all** atoms matching *ref_atom* in the universe.
 
+    For mixed systems (e.g. ``ref_atom="CA,P"``), each atom type is counted
+    separately and divided by its own per-segment count before summing, so
+    that each molecule contributes exactly 1.0 to the monomer count regardless
+    of how many reference atoms it exposes.
+
     Args:
         u (MDAnalysis.Universe): Universe at the current (recentered) frame.
         droplet_center (np.ndarray): 3-D Cartesian coordinates of the droplet
             centre, in ångström.
-        ca_per_segment (int): Number of reference atoms per monomer (derived
-            from the selected species, not the full universe).
-        ref_atom (str): Reference atom name (default: ``"CA"``).
+        ref_atom (str): Comma-separated reference atom name(s)
+            (e.g. ``"CA"``, ``"P"``, or ``"CA,P"``).
+        ref_counts (Optional[dict[str, int]]): Maps each atom name to the
+            number of that atom per segment (e.g. ``{"CA": 38, "P": 20}``).
+            If ``None``, falls back to counting all matched atoms together
+            and dividing by their total (legacy behaviour, correct only for
+            homo-molecular systems).
         r_max (float): Maximum radius, in ångström.
         dr (float): Radial bin width, in ångström.
 
@@ -2544,24 +2573,30 @@ def _radial_density(u, droplet_center: np.ndarray, ca_per_segment: int,
         - **r_bins** — Bin centres, shape ``(n_bins,)``, in ångström.
         - **concentration** — Monomer concentration per shell, in mM.
     """
-    all_ca    = u.select_atoms(f"name {ref_atom}")
-    distances = np.linalg.norm(all_ca.positions - droplet_center, axis=1)
-
     n_bins = int(r_max / dr)
     bins   = np.linspace(0, r_max, n_bins + 1)
     r_bins = (bins[:-1] + bins[1:]) / 2.0
+    monomer_counts = np.zeros(n_bins, dtype=np.float64)
 
-    ca_counts, _   = np.histogram(distances, bins=bins)
-    monomer_counts = ca_counts / ca_per_segment
-    shell_vols     = (4.0 / 3.0) * np.pi * (bins[1:] ** 3 - bins[:-1] ** 3)
-    concentration  = (monomer_counts / shell_vols) * (1e30 / AVOGADRO)
+    ref_names = [n.strip() for n in ref_atom.split(",") if n.strip()]
+    for name in ref_names:
+        ag = u.select_atoms(f"name {name}")
+        if len(ag) == 0:
+            continue
+        distances = np.linalg.norm(ag.positions - droplet_center, axis=1)
+        counts, _ = np.histogram(distances, bins=bins)
+        divisor   = ref_counts[name] if (ref_counts and name in ref_counts) else max(len(ag), 1)
+        monomer_counts += counts / divisor
 
+    shell_vols    = (4.0 / 3.0) * np.pi * (bins[1:] ** 3 - bins[:-1] ** 3)
+    concentration = (monomer_counts / shell_vols) * (1e30 / AVOGADRO)
     return r_bins, concentration
 
 
-def _slab_density(u, droplet_center: np.ndarray, ca_per_segment: int,
+def _slab_density(u, droplet_center: np.ndarray,
                    ref_atom: str, r_max: float, dr: float,
-                   omitted_axis: int, box: np.ndarray) -> tuple:
+                   omitted_axis: int, box: np.ndarray,
+                   ref_counts: Optional[dict] = None) -> tuple:
     """Compute the 1-D slab monomer concentration profile for a flat (2D)
     aggregate — e.g. a membrane-bound or interfacially confined slab.
 
@@ -2571,23 +2606,24 @@ def _slab_density(u, droplet_center: np.ndarray, ca_per_segment: int,
     convention is applied along that axis so PBC-wrapped atoms are still
     binned relative to the (possibly re-centred) droplet/slab centre.
 
+    For mixed systems each atom type is counted separately and divided by its
+    own per-segment count before summing.
+
     Always operates on **all** atoms matching *ref_atom* in the universe.
 
     Args:
         u (MDAnalysis.Universe): Universe at the current (recentered) frame.
         droplet_center (np.ndarray): 3-D Cartesian coordinates of the slab
             centre, in ångström (typically the box centre after recentering).
-        ca_per_segment (int): Number of reference atoms per monomer.
-        ref_atom (str): Reference atom name (e.g. ``"CA"``).
+        ref_atom (str): Comma-separated reference atom name(s).
         r_max (float): Half-range of the profile, in ångström.  Bins span
             ``[-r_max, +r_max]`` relative to *droplet_center*.
         dr (float): Bin width, in ångström.
         omitted_axis (int): Axis index (0=X, 1=Y, 2=Z) along which the
             profile is computed — i.e. the axis normal to the slab plane.
-        box (np.ndarray): Current frame's box dimensions, shape ``(6,)``
-            (``[Lx, Ly, Lz, alpha, beta, gamma]``), used both for PBC
-            wrapping along *omitted_axis* and for the in-plane cross-section
-            area used to normalise counts into a volumetric concentration.
+        box (np.ndarray): Current frame's box dimensions, shape ``(6,)``.
+        ref_counts (Optional[dict[str, int]]): Maps each atom name to the
+            number of that atom per segment.  ``None`` uses legacy fallback.
 
     Returns:
         tuple[np.ndarray, np.ndarray]:
@@ -2596,28 +2632,29 @@ def _slab_density(u, droplet_center: np.ndarray, ca_per_segment: int,
           *omitted_axis*, shape ``(n_bins,)``, in ångström.
         - **concentration** — Monomer concentration per slab bin, in mM.
     """
-    all_ca = u.select_atoms(f"name {ref_atom}")
-    values = all_ca.positions[:, omitted_axis] - droplet_center[omitted_axis]
-
-    # Minimum-image wrap along the profiled axis only.
-    L = box[omitted_axis]
-    if L > 0:
-        values = values - L * np.round(values / L)
-
     n_bins = int(round(2 * r_max / dr))
     half   = n_bins * dr / 2.0
     bins   = np.linspace(-half, half, n_bins + 1)
     r_bins = 0.5 * (bins[:-1] + bins[1:])
+    monomer_counts = np.zeros(n_bins, dtype=np.float64)
 
-    ca_counts, _   = np.histogram(values, bins=bins)
-    monomer_counts = ca_counts / ca_per_segment
+    L = box[omitted_axis]
+    ref_names = [n.strip() for n in ref_atom.split(",") if n.strip()]
+    for name in ref_names:
+        ag = u.select_atoms(f"name {name}")
+        if len(ag) == 0:
+            continue
+        values = ag.positions[:, omitted_axis] - droplet_center[omitted_axis]
+        if L > 0:
+            values = values - L * np.round(values / L)
+        counts, _ = np.histogram(values, bins=bins)
+        divisor   = ref_counts[name] if (ref_counts and name in ref_counts) else max(len(ag), 1)
+        monomer_counts += counts / divisor
 
-    # In-plane cross-section area (product of the two non-omitted axes).
     in_plane_axes = [ax for ax in range(3) if ax != omitted_axis]
     area          = box[in_plane_axes[0]] * box[in_plane_axes[1]]
     slab_vols     = area * dr
     concentration = (monomer_counts / slab_vols) * (1e30 / AVOGADRO)
-
     return r_bins, concentration
 
 
@@ -2692,11 +2729,24 @@ def _worker(
     segs, _, sel_indices = _grp_init(u, ref_atom=ref, step=castep,
                                      sel_indices=sel_indices)
 
-    # Use the first *selected* segment so ca_per_segment reflects the correct
-    # molecule type even when sel_indices does not start at 0.
-    ca_per_segment = len(
-        u.segments[sel_indices[0]].atoms.select_atoms(f"name {ref}")
-    )
+    # Build ref_counts: {atom_name: n_atoms_per_segment} for each ref atom type.
+    # For mixed systems (e.g. ref="CA,P"), protein segments contribute to "CA"
+    # and nucleic acid segments to "P".  We average the per-segment count within
+    # each type so each molecule contributes exactly 1.0 to the density profile
+    # regardless of how many ref atoms it exposes.
+    ref_names   = [n.strip() for n in ref.split(",") if n.strip()]
+    type_counts: dict = {name: [] for name in ref_names}
+    for seg_idx in sel_indices:
+        seg_obj = u.segments[seg_idx]
+        for name in ref_names:
+            ag = seg_obj.atoms.select_atoms(f"name {name}")
+            if len(ag) > 0:
+                type_counts[name].append(len(ag))
+                break   # same first-match logic as _grp_init
+    ref_counts = {
+        name: int(round(np.mean(v))) if v else 1
+        for name, v in type_counts.items()
+    }
 
     stats_data:       list = []
     density_profiles: list = []
@@ -2750,7 +2800,7 @@ def _worker(
                             r_bins, conc = _slab_density(
                                 u,
                                 droplet_center=box[:3] / 2.0,
-                                ca_per_segment=ca_per_segment,
+                                ref_counts=ref_counts,
                                 ref_atom=ref,
                                 r_max=r_max,
                                 dr=dr,
@@ -2762,7 +2812,7 @@ def _worker(
                             r_bins, conc = _radial_density(
                                 u,
                                 droplet_center=box[:3] / 2.0,
-                                ca_per_segment=ca_per_segment,
+                                ref_counts=ref_counts,
                                 ref_atom=ref,
                                 r_max=r_max,
                                 dr=dr,
@@ -2827,7 +2877,7 @@ def cmd_aggr(
     out:     Annotated[str,  typer.Option("--out",     help="Aggregation statistics output")] = "aggr.dat",
     outtraj: Annotated[str,  typer.Option("--outtraj", help="Recentered trajectory output")] = "recentered.xtc",
     profile: Annotated[str,  typer.Option("--profile", help="Radial density profile output")] = "density_profile.dat",
-    ref:     Annotated[str,  typer.Option("--ref",     help="Reference atom name (CA or P)")] = "CA",
+    ref:     Annotated[str,  typer.Option("--ref",     help="Reference atom name(s) for clustering and density. Single: 'CA' (protein) or 'P' (nucleic/lipid). Comma-separated for mixed systems: 'CA,P'.")] = "CA",
     rcut:    Annotated[float, typer.Option("--rcut",   help="Clustering distance cutoff (Å)")] = 8.0,
     castep:  Annotated[int,   typer.Option("--castep", help="Use every Nth ref atom for clustering")] = 1,
     start:   Annotated[Optional[int], typer.Option("--start",  help="First frame index")] = None,
@@ -3017,11 +3067,23 @@ def cmd_aggr(
         typer.echo(f"[!] {exc}", err=True)
         raise typer.Exit(1)
 
-    # ca_per_segment: count ref atoms on the first selected segment.
-    # _grp_init already guaranteed this is > 0, so no further guard needed.
-    ca_per_segment = len(
-        u.segments[sel_indices[0]].atoms.select_atoms(f"name {ref}")
-    )
+    # ref_counts: {atom_name: n_atoms_per_segment} per ref atom type.
+    # For mixed systems (e.g. ref="CA,P") protein segments contribute to "CA"
+    # and nucleic acid segments to "P"; averaging within each type means every
+    # molecule contributes exactly 1.0 to the density normalisation.
+    ref_names_list = [n.strip() for n in ref.split(",") if n.strip()]
+    _type_counts: dict = {name: [] for name in ref_names_list}
+    for _seg_idx in sel_indices:
+        _seg_obj = u.segments[_seg_idx]
+        for _name in ref_names_list:
+            _ag = _seg_obj.atoms.select_atoms(f"name {_name}")
+            if len(_ag) > 0:
+                _type_counts[_name].append(len(_ag))
+                break
+    ref_counts = {
+        name: int(round(np.mean(v))) if v else 1
+        for name, v in _type_counts.items()
+    }
 
     # Display selected segids for clarity
     first_segid = u.segments[sel_indices[0]].segid
@@ -3030,7 +3092,7 @@ def cmd_aggr(
     typer.echo(f"[i] Segments (total)   : {len(u.segments)}")
     typer.echo(f"[i] Segments (cluster) : {len(sel_indices)}  "
                f"({first_segid} … {last_segid})")
-    typer.echo(f"[i] {ref} / segment       : {ca_per_segment}")
+    typer.echo(f"[i] Ref counts         : {ref_counts}")
     typer.echo(f"[i] Frames             : {n_frames}")
     typer.echo(f"[i] Cutoff             : {rcut} Å")
     typer.echo(f"[i] nproc              : {nproc}")
@@ -3098,7 +3160,8 @@ def cmd_aggr(
 
                     # ── Recentering: full universe ──────────────────────────
                     u.atoms.positions = _recenter_frame(u, largest_univ, box)
-                    writer.write(u.atoms)
+                    if writer:
+                        writer.write(u.atoms)
 
                     if density and ts_idx >= n_frames - n_frames_avg:
                         # ── Density: full universe ──────────────────────────
@@ -3107,7 +3170,7 @@ def cmd_aggr(
                             r_bins, conc = _slab_density(
                                 u,
                                 droplet_center=box[:3] / 2.0,
-                                ca_per_segment=ca_per_segment,
+                                ref_counts=ref_counts,
                                 ref_atom=ref,
                                 r_max=r_max,
                                 dr=dr,
@@ -3119,7 +3182,7 @@ def cmd_aggr(
                             r_bins, conc = _radial_density(
                                 u,
                                 droplet_center=box[:3] / 2.0,
-                                ca_per_segment=ca_per_segment,
+                                ref_counts=ref_counts,
                                 ref_atom=ref,
                                 r_max=r_max,
                                 dr=dr,
