@@ -1624,7 +1624,7 @@ def cmd_vector_acf(
 
 
 # =============================================================================
-#  ░░  7.  Contact Map  ░░
+#  ░░  7.  Contact Map (Optimized)  ░░
 # =============================================================================
 
 HEAVY_ATOMS = "name CA CB CC CD CE CF"
@@ -1632,40 +1632,10 @@ HEAVY_ATOMS = "name CA CB CC CD CE CF"
 
 
 def _parse_components(spec, segids):
-    """Parse a component specification string into a mapping of label → segid list.
-
-    Supports two modes determined by whether the value after ``:`` is an integer
-    (count mode) or a glob pattern (pattern mode).  If *spec* is ``None``, all
-    segids are placed in a single component labelled ``"A"``.
-
-    **Count mode** (original behaviour) — values after ``:`` are integers;
-    segids are consumed sequentially from *segids* in the order they appear::
-
-        "A:12 B:10"   # first 12 segids → A, next 10 → B
-
-    **Pattern mode** — values after ``:`` are ``fnmatch`` glob patterns matched
-    against *segids*; useful when copies of different components are interleaved
-    in the topology::
-
-        "A:PA* B:PB*"   # all segids matching PA* → A, all matching PB* → B
-
-    Args:
-        spec (Optional[str]): Component spec string, e.g. ``"A:12 B:10"`` or
-            ``"A:PA* B:PB*"``.  ``None`` places all segids into component ``"A"``.
-        segids (list[str]): Ordered list of unique segids detected from the topology.
-
-    Returns:
-        dict[str, list[str]]: Mapping ``{label: [segid, ...]}``.
-
-    Raises:
-        ValueError: In count mode, if the total count does not match ``len(segids)``.
-        ValueError: In pattern mode, if a pattern matches no segids, or if the
-            union of all patterns does not cover every segid exactly once.
-    """
+    """Parse a component specification string into a mapping of label → segid list."""
     if spec is None:
         return {"A": segids}
 
-    # Detect mode: pattern mode if any value after ':' is not a plain integer
     if any(not t.split(":")[1].isdigit() for t in spec.split()):
         import fnmatch
         comp_map = {}
@@ -1682,7 +1652,6 @@ def _parse_components(spec, segids):
             )
         return comp_map
 
-    # Count mode (original behaviour)
     comp_map = {}
     idx = 0
     for token in spec.split():
@@ -1698,18 +1667,7 @@ def _parse_components(spec, segids):
 
 
 def _parse_pairs(spec, comp_labels):
-    """Parse a pair specification string into a list of ``(labelX, labelY)`` tuples.
-
-    Args:
-        spec (str): Space-separated pair tokens, e.g. ``"A-A A-B"``.
-        comp_labels (list[str]): Known component labels.
-
-    Returns:
-        list[tuple[str, str]]: Ordered list of requested component pairs.
-
-    Raises:
-        ValueError: If a token references an unknown component label.
-    """
+    """Parse a pair specification string into a list of (labelX, labelY) tuples."""
     pairs = []
     for token in spec.split():
         x, y = token.split("-")
@@ -1720,56 +1678,31 @@ def _parse_pairs(spec, comp_labels):
 
 
 def _contacts_worker(args):
-    """Subprocess worker: accumulate contact matrices for all requested pairs over a frame chunk.
+    """Optimised subprocess worker for contact-map accumulation.
 
-    Uses ``MDAnalysis.lib.distances.capped_distance`` for efficient
-    neighbour-list construction.  Supports multi-component systems with
-    arbitrary same- and cross-component contact pair requests.
+    Key optimisations:
+      1. Per-pair capped_distance — two-group for cross-component, self for
+         same-component — instead of one massive all-vs-all call.
+      2. 1D integer packing for np.unique (fast int64 sort) instead of the
+         extremely expensive 2D np.unique(..., axis=0).
+      3. Pre-split atom arrays by component — zero per-frame filtering overhead.
+      4. For same-component self-distance, only i<j atom pairs are kept then
+         residue indices are explicitly symmetrised, halving raw pair count.
 
-    For same-component pairs the worker accumulates:
-
-    - **intra** — contacts within the same chain copy (sequence separation ≥ 4).
-    - **inter** — contacts between different chain copies of the same component.
-
-    For cross-component pairs only **inter** (cross-component) contacts are
-    accumulated.
-
-    Args:
-        args (tuple): A packed argument tuple containing:
-
-            - **top** (*str*) — Path to the topology file.
-            - **traj** (*Optional[str]*) — Path to the trajectory file, or
-              ``None`` for a single-frame topology.
-            - **cutoff** (*float*) — Distance cutoff in ångström.
-            - **frame_indices** (*list[int]*) — Absolute frame indices to
-              process in this worker.
-            - **atom_to_local** (*np.ndarray[int32]*) — Maps each heavy-atom
-              row to its local residue index within its chain copy.
-            - **atom_to_copy** (*np.ndarray[int32]*) — Maps each heavy-atom
-              row to its copy index within its component.
-            - **atom_to_comp** (*np.ndarray[int32]*) — Maps each heavy-atom
-              row to its component index.
-            - **pair_specs** (*list[tuple]*) — List of
-              ``(comp_idx_X, comp_idx_Y, N_X, N_Y, n_copies_X, same_comp)``
-              tuples, one per requested pair.
-
-    Returns:
-        dict[tuple[int,int], dict[str, Optional[np.ndarray]]]:
-        ``{(cx, cy): {"inter": np.ndarray, "intra": np.ndarray or None}}``
-        with partial contact counts accumulated over the assigned frames.
+    Binary contact semantics are preserved: multiple atom–atom contacts between
+    the same residue pair in the same copy-pair count as ONE contact.
     """
     _suppress_warnings()
     import MDAnalysis as mda
     from MDAnalysis.lib.distances import capped_distance
 
-    # Added sel_str to the unpacked arguments
     (top, traj, cutoff, frame_indices,
-     atom_to_local, atom_to_copy, atom_to_comp,
-     pair_specs, sel_str) = args
+     comp_data, pair_specs, sel_str) = args
 
     u       = mda.Universe(top, traj) if traj else mda.Universe(top)
-    all_hvy = u.select_atoms(sel_str) # Use the dynamic selection
+    all_hvy = u.select_atoms(sel_str)
 
+    # ── Initialise accumulators ───────────────────────────────────────────
     partials = {}
     for spec in pair_specs:
         cx, cy, N_X, N_Y, _, same = spec
@@ -1779,66 +1712,130 @@ def _contacts_worker(args):
             "intra": np.zeros((N_X, N_X), dtype=np.float64) if same else None,
         }
 
+    # ── Frame loop ────────────────────────────────────────────────────────
     for frame in frame_indices:
         u.trajectory[frame]
         pos_all = all_hvy.positions
         box     = u.dimensions
-
-        pairs, _ = capped_distance(pos_all, pos_all, cutoff,
-                                   box=box, return_distances=True)
-        if len(pairs) == 0:
-            continue
-
-        ri   = pairs[:, 0].astype(np.int32)
-        rj   = pairs[:, 1].astype(np.int32)
-        li   = atom_to_local[ri]
-        lj   = atom_to_local[rj]
-        ci   = atom_to_copy[ri]
-        cj   = atom_to_copy[rj]
-        cmpi = atom_to_comp[ri]
-        cmpj = atom_to_comp[rj]
-
-        # Filter out garbage indices (unmapped atoms from np.full)
-        valid = (li != -1) & (lj != -1)
-        li, lj, ci, cj, cmpi, cmpj = li[valid], lj[valid], ci[valid], cj[valid], cmpi[valid], cmpj[valid]
 
         for spec in pair_specs:
             cx, cy, N_X, N_Y, _, same = spec
             key = (cx, cy)
 
             if same:
-                # ── Intra (same copy, same component) ────────────────────
-                intra_mask = (cmpi == cx) & (cmpj == cx) & (ci == cj) & (np.abs(li - lj) >= 4)
-                if intra_mask.any():
-                    k    = np.unique(np.stack([ci[intra_mask], li[intra_mask], lj[intra_mask]], axis=1), axis=0)
-                    flat = k[:, 1] * N_X + k[:, 2]
-                    m    = np.bincount(flat, minlength=N_X * N_X).reshape(N_X, N_X).astype(np.float64)
-                    partials[key]["intra"] += m
+                # ═══ Same-component: self capped_distance ═══
+                idx_c   = comp_data[cx]["indices"]
+                pos_c   = pos_all[idx_c]
+                local_c = comp_data[cx]["local"]
+                copy_c  = comp_data[cx]["copy"]
+                n_copies = comp_data[cx]["n_copies"]
 
-                # ── Inter (different copies, same component) ──────────────
-                inter_mask = (cmpi == cx) & (cmpj == cx) & (ci != cj)
+                pairs_found, _ = capped_distance(
+                    pos_c, pos_c, cutoff, box=box, return_distances=True
+                )
+                if len(pairs_found) == 0:
+                    continue
+
+                # Keep only i < j — each atom contact counted once
+                mask_lt = pairs_found[:, 0] < pairs_found[:, 1]
+                pi = pairs_found[mask_lt, 0].astype(np.intp)
+                pj = pairs_found[mask_lt, 1].astype(np.intp)
+
+                li = local_c[pi]
+                lj = local_c[pj]
+                ci = copy_c[pi]
+                cj = copy_c[pj]
+
+                # ── Intra: same copy, sequence separation ≥ 4 ────────────
+                intra_mask = (ci == cj) & (np.abs(li - lj) >= 4)
+                if intra_mask.any():
+                    li_in = li[intra_mask]
+                    lj_in = lj[intra_mask]
+                    ci_in = ci[intra_mask]
+
+                    # Symmetrise residue pairs (original saw both directions)
+                    li_sym = np.concatenate([li_in, lj_in])
+                    lj_sym = np.concatenate([lj_in, li_in])
+                    ci_sym = np.concatenate([ci_in, ci_in])
+
+                    # 1D pack: copy * N² + res_i * N + res_j
+                    NN   = np.int64(N_X) * np.int64(N_X)
+                    pack = (ci_sym.astype(np.int64) * NN
+                            + li_sym.astype(np.int64) * N_X
+                            + lj_sym.astype(np.int64))
+                    unique_pack = np.unique(pack)
+                    flat_res = (unique_pack % NN).astype(np.intp)
+                    partials[key]["intra"] += (
+                        np.bincount(flat_res, minlength=N_X * N_X)
+                        .reshape(N_X, N_X).astype(np.float64)
+                    )
+
+                # ── Inter: different copies ───────────────────────────────
+                inter_mask = ci != cj
                 if inter_mask.any():
-                    k2    = np.unique(np.stack([ci[inter_mask], cj[inter_mask],
-                                                li[inter_mask], lj[inter_mask]], axis=1), axis=0)
-                    flat2 = k2[:, 2] * N_X + k2[:, 3]
-                    m2    = np.bincount(flat2, minlength=N_X * N_Y).reshape(N_X, N_Y).astype(np.float64)
-                    partials[key]["inter"] += m2
+                    li_in = li[inter_mask]
+                    lj_in = lj[inter_mask]
+                    ci_in = ci[inter_mask]
+                    cj_in = cj[inter_mask]
+
+                    # Symmetrise copy-pair direction: (ci,cj,li,lj) ↔ (cj,ci,lj,li)
+                    li_sym = np.concatenate([li_in, lj_in])
+                    lj_sym = np.concatenate([lj_in, li_in])
+                    ci_sym = np.concatenate([ci_in, cj_in])
+                    cj_sym = np.concatenate([cj_in, ci_in])
+
+                    # 1D pack: (ci*n_copies + cj) * N² + res_i * N + res_j
+                    NN   = np.int64(N_X) * np.int64(N_X)
+                    pack = ((ci_sym.astype(np.int64) * n_copies
+                             + cj_sym.astype(np.int64)) * NN
+                            + li_sym.astype(np.int64) * N_X
+                            + lj_sym.astype(np.int64))
+                    unique_pack = np.unique(pack)
+                    flat_res = (unique_pack % NN).astype(np.intp)
+                    partials[key]["inter"] += (
+                        np.bincount(flat_res, minlength=N_X * N_X)
+                        .reshape(N_X, N_X).astype(np.float64)
+                    )
 
             else:
-                # ── Cross-component contacts (cx → cy and cy → cx) ───────
-                mask_xy = (cmpi == cx) & (cmpj == cy)
-                mask_yx = (cmpi == cy) & (cmpj == cx)
+                # ═══ Cross-component: two-group capped_distance ═══
+                idx_cx   = comp_data[cx]["indices"]
+                idx_cy   = comp_data[cy]["indices"]
+                pos_cx   = pos_all[idx_cx]
+                pos_cy   = pos_all[idx_cy]
+                local_cx = comp_data[cx]["local"]
+                local_cy = comp_data[cy]["local"]
+                copy_cx  = comp_data[cx]["copy"]
+                copy_cy  = comp_data[cy]["copy"]
+                n_copies_y = comp_data[cy]["n_copies"]
 
-                li_cx = np.concatenate([li[mask_xy], lj[mask_yx]])
-                lj_cy = np.concatenate([lj[mask_xy], li[mask_yx]])
-                ci_cx = np.concatenate([ci[mask_xy], cj[mask_yx]])
-                cj_cy = np.concatenate([cj[mask_xy], ci[mask_yx]])
+                # Two-group: each X–Y contact returned exactly once
+                pairs_found, _ = capped_distance(
+                    pos_cx, pos_cy, cutoff, box=box, return_distances=True
+                )
+                if len(pairs_found) == 0:
+                    continue
 
-                if len(li_cx) > 0:
-                    k3    = np.unique(np.stack([ci_cx, cj_cy, li_cx, lj_cy], axis=1), axis=0)
-                    flat3 = k3[:, 2] * N_Y + k3[:, 3]
-                    m3    = np.bincount(flat3, minlength=N_X * N_Y).reshape(N_X, N_Y).astype(np.float64)
-                    partials[key]["inter"] += m3
+                pi = pairs_found[:, 0].astype(np.intp)
+                pj = pairs_found[:, 1].astype(np.intp)
+
+                li = local_cx[pi]
+                lj = local_cy[pj]
+                ci = copy_cx[pi]
+                cj = copy_cy[pj]
+
+                # 1D pack: (ci*n_copies_y + cj) * (N_X*N_Y) + li*N_Y + lj
+                NXY  = np.int64(N_X) * np.int64(N_Y)
+                pack = ((ci.astype(np.int64) * n_copies_y
+                         + cj.astype(np.int64)) * NXY
+                        + li.astype(np.int64) * N_Y
+                        + lj.astype(np.int64))
+                unique_pack = np.unique(pack)
+                flat_res = (unique_pack % NXY).astype(np.intp)
+                partials[key]["inter"] += (
+                    np.bincount(flat_res, minlength=N_X * N_Y)
+                    .reshape(N_X, N_Y).astype(np.float64)
+                )
 
     return partials
 
@@ -1854,49 +1851,38 @@ def cmd_contacts(
     pairs: Annotated[Optional[str], typer.Option("--pairs",
         help="Contact pairs to compute e.g. 'A-A A-B B-B'. "
              "Default: all same-component pairs.")] = None,
-    ref: Annotated[str, typer.Option("--ref", 
-        help="Selection string for the reference atom defining a residue sequence (default: 'name CA'). Give the unique atom name for each residue.")] = "name CA",
-    sel: Annotated[str, typer.Option("--sel", 
-        help="Selection string for atoms involved in the contact calculation.")] = "name CA CB CC CD CE CF",
+    ref: Annotated[str, typer.Option("--ref",
+        help="Selection for reference atom defining residue sequence.")] = "name CA",
+    sel: Annotated[str, typer.Option("--sel",
+        help="Selection for atoms in the contact calculation.")] = "name CA CB CC CD CE CF",
     start: Annotated[int, typer.Option("--start")] = 0,
     stop: Annotated[Optional[int], typer.Option("--stop")] = None,
     stride: Annotated[int, typer.Option("--stride")] = 1,
     nproc: Annotated[int, typer.Option("--nproc")] = 1,
     out: Annotated[str, typer.Option("--out", help="Output stem")] = "contact_map.npy",
 ):
-    """Calculate intra- and inter-chain **contact maps** for multi-component systems (parallel).
+    """Calculate intra- and inter-chain contact maps for multi-component systems (parallel).
 
-    Identifies contacts between target atoms (--sel) within a user-defined distance cutoff, 
-    accounting for periodic boundary conditions. Supports systems containing multiple distinct 
+    Identifies contacts between target atoms (--sel) within a user-defined distance cutoff,
+    accounting for periodic boundary conditions. Supports systems containing multiple distinct
     components (e.g., proteins, lipids, coarse-grained polymers).
-
-    Components are defined by grouping auto-detected segids using a reference atom (--ref)::
-
-        --components "A:100 B:100"   # first 100 segids → A, next 100 → B
-
-    Contact pairs to compute::
-
-        --pairs "A-A A-B B-B"   # default: all same-component pairs
 
     Normalisation: sum over all copy pairs / (n_copies_X × n_frames), giving the
     average contacts that residue i of one copy makes with residue j per frame.
-    Warning: for A-B contacts, if number of copies is not symmetric, the normalization is not symmetric,
-    meaning the contact map will not be symmetric A-B != B-A.
     """
     _suppress_warnings()
     import MDAnalysis as mda
     import time
     import multiprocessing as mp
-    import numpy as np
 
     u = mda.Universe(top, traj) if traj else mda.Universe(top)
-    
+
     # ── Component setup using --ref ────────────────────────────────────────
     all_ref = u.select_atoms(ref)
     if len(all_ref) == 0:
         typer.echo(f"[!] No atoms found matching reference selection: '{ref}'", err=True)
         raise typer.Exit(1)
-        
+
     segids = list(dict.fromkeys(all_ref.segids))
     n_traj = len(u.trajectory)
 
@@ -1906,28 +1892,27 @@ def cmd_contacts(
     req_pairs = _parse_pairs(pairs, comp_labels) if pairs else [(x, x) for x in comp_labels]
 
     comp_ref = {label: [u.select_atoms(f"segid {s} and ({ref})") for s in segs]
-               for label, segs in comp_map.items()}
-               
-    comp_N  = {}
+                for label, segs in comp_map.items()}
+
+    comp_N = {}
     for label, ref_list in comp_ref.items():
         Ns = [len(r) for r in ref_list]
         if len(set(Ns)) != 1:
-            typer.echo(f"[!] Component {label} has unequal residue counts based on '{ref}': {set(Ns)}", err=True)
+            typer.echo(f"[!] Component {label} has unequal residue counts: {set(Ns)}", err=True)
             raise typer.Exit(1)
         comp_N[label] = Ns[0]
 
     comp_idx = {label: i for i, label in enumerate(comp_labels)}
 
-    # ── Lookup arrays using --sel ──────────────────────────────────────────
-    all_hvy     = u.select_atoms(sel)
+    # ── Build lookup arrays using --sel ────────────────────────────────────
+    all_hvy = u.select_atoms(sel)
     if len(all_hvy) == 0:
         typer.echo(f"[!] No atoms found matching contact selection: '{sel}'", err=True)
         raise typer.Exit(1)
-        
+
     M           = len(all_hvy)
     all_hvy_idx = all_hvy.indices
 
-    # Initialize with -1 to safely handle atoms that match --sel but aren't in a --ref residue
     atom_to_local = np.full(M, -1, dtype=np.int32)
     atom_to_copy  = np.full(M, -1, dtype=np.int32)
     atom_to_comp  = np.full(M, -1, dtype=np.int32)
@@ -1936,7 +1921,6 @@ def cmd_contacts(
         cidx = comp_idx[label]
         for copy_within, ref_atoms in enumerate(ref_list):
             for res_local, res in enumerate(ref_atoms.residues):
-                # Find which contact atoms (--sel) belong to this specific residue
                 res_hvy_idx = np.intersect1d(res.atoms.indices, all_hvy_idx)
                 if len(res_hvy_idx) > 0:
                     rows = np.searchsorted(all_hvy_idx, res_hvy_idx)
@@ -1946,6 +1930,19 @@ def cmd_contacts(
 
     comp_resids  = {label: comp_ref[label][0].residues.resids for label in comp_labels}
     comp_ncopies = {label: len(segs) for label, segs in comp_map.items()}
+
+    # ── Build per-component pre-split data for workers ─────────────────────
+    comp_data = {}
+    for label in comp_labels:
+        cidx = comp_idx[label]
+        mask = (atom_to_comp == cidx) & (atom_to_local != -1)
+        indices = np.where(mask)[0]
+        comp_data[cidx] = {
+            "indices":  indices,
+            "local":    atom_to_local[indices],
+            "copy":     atom_to_copy[indices],
+            "n_copies": comp_ncopies[label],
+        }
 
     pair_specs = [
         (comp_idx[x], comp_idx[y], comp_N[x], comp_N[y], comp_ncopies[x], x == y)
@@ -1966,10 +1963,12 @@ def cmd_contacts(
     typer.echo(f"Cutoff     : {cutoff} Å  ({cutoff / 10:.2f} nm)")
     typer.echo(f"Frames     : {n_frames}  (stride={stride})")
     typer.echo(f"Workers    : {nprocs}")
+    for cidx, cdata in comp_data.items():
+        typer.echo(f"  Comp {cidx}: {len(cdata['indices'])} atoms, {cdata['n_copies']} copies")
 
     chunks      = [frames[i::nprocs] for i in range(nprocs)]
     worker_args = [
-        (top, traj, cutoff, chunk, atom_to_local, atom_to_copy, atom_to_comp, pair_specs, sel)
+        (top, traj, cutoff, chunk, comp_data, pair_specs, sel)
         for chunk in chunks
     ]
 
