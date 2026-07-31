@@ -356,6 +356,30 @@ def color_cycle(id):
     }
     return colors.get(id, '#000000')
 
+def tcolor(color, alpha=0.5):
+    """
+    Convert a hex color string to an RGBA tuple with specified transparency.
+
+    Parameters
+    ----------
+    color : str
+        Hex color string (e.g., ``'#1f77b4'``).
+    alpha : float, optional
+        Transparency level in the range [0, 1] (default ``0.5``).
+
+    Returns
+    -------
+    tuple
+        RGBA tuple with values in [0, 1].
+
+    Examples
+    --------
+    >>> rgba = tcolor('#ff7f0e', alpha=0.3)
+    >>> ax.plot(x, y, color=rgba)
+    """
+    transparent_color = mpl.colors.to_rgba(color, alpha=alpha)
+    return transparent_color
+
 
 def savefig(fig, filename, *args, **kwargs):
     """
