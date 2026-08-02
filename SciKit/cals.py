@@ -438,3 +438,52 @@ def general_fit(func, xs, ys, yerrs=None, xrange=None, p0=None, bounds=(-np.inf,
     yfit_err = np.sqrt(yfit_var)
 
     return {"params": params, "perr": perr, "xfit": xfit, "yfit": yfit, "yfit_err": yfit_err}
+
+def saxs_scale(q1, I1, q2, I2):
+    """
+    Scale SAXS intensity data I1(q1) to match I2(q2) using a least-squares
+    approach. The scaling factor is determined by minimizing the difference
+    between the two datasets over their overlapping q range.
+
+    Parameters
+    ----------
+    q1 : array-like
+        Scattering vector magnitudes for the first dataset (1/Angstrom).
+    I1 : array-like
+        Scattering intensities for the first dataset.
+    q2 : array-like
+        Scattering vector magnitudes for the second dataset (1/Angstrom).
+    I2 : array-like
+        Scattering intensities for the second dataset.
+
+    Returns
+    -------
+    scale_factor : float
+        Scaling factor applied to I1 to best match I2.
+    """
+    from scipy.optimize import minimize
+
+    # Find the common x-range where both datasets overlap
+    x_min, x_max = max(min(q1), min(q2)), min(max(q1), max(q2))
+    
+    # Select only data within this common range
+    mask1 = (q1 >= x_min) & (q1 <= x_max)
+    mask2 = (q2 >= x_min) & (q2 <= x_max)
+    
+    x1_common, y1_common = q1[mask1], I1[mask1]
+    
+    # Interpolate data2 onto x1's x-values
+    y2_interp = np.interp(x1_common, q2[mask2], I2[mask2])
+    
+    # Define the objective function to find the best scale factor
+    def objective(s):
+        return np.sum((y1_common - (s * y2_interp)) ** 2)  # Minimize squared difference
+    
+    # Optimize the scaling factor
+    result = minimize(objective, x0=1)  # Initial scale factor = 1
+    best_scale = result.x[0]
+    
+    # Apply the best scaling factor
+    y2_scaled = I2 * best_scale
+
+    return y2_scaled
