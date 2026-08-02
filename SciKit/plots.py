@@ -961,3 +961,34 @@ def color_text(fig, ax, x, y, parts, colors, sep="", **kwargs):
             )
             fig.canvas.draw()
             offset += sep_text.get_window_extent().width / fig.dpi * 72
+
+def axlines(ax, x=(), y=(), **kwargs):
+    """
+    Plot vertical and/or horizontal reference lines on a matplotlib Axes.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axes to draw on.
+    x : float or sequence of float, optional
+        X-position(s) at which to draw vertical lines (via `ax.axvline`).
+        A single number is also accepted. Default is () (no vertical lines).
+    y : float or sequence of float, optional
+        Y-position(s) at which to draw horizontal lines (via `ax.axhline`).
+        A single number is also accepted. Default is () (no horizontal lines).
+    **kwargs
+        Additional keyword arguments passed to both `axvline` and `axhline`
+        (e.g. color, linestyle, linewidth, alpha).
+
+    Examples
+    --------
+    >>> axlines(ax, x=(1, 2, 3))
+    >>> axlines(ax, y=0, color='red')
+    >>> axlines(ax, x=(1, 2), y=(0, 5), ls='--', linewidth=0.8)
+    """
+    x = (x,) if isinstance(x, (int, float)) else x
+    y = (y,) if isinstance(y, (int, float)) else y
+    for xi in x:
+        ax.axvline(xi, **kwargs)
+    for yi in y:
+        ax.axhline(yi, **kwargs)
