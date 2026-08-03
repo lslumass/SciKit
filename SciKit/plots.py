@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def general_temp(num_row, num_col, size_x, size_y, pad=(0.2, 0.5), *args, **kwargs):
+def general_temp(num_row, num_col, size_x, size_y, palette=None, pad=(0.2, 0.5), *args, **kwargs):
     """
     Create a standardized matplotlib figure with a grid of subplots.
 
@@ -21,6 +21,7 @@ def general_temp(num_row, num_col, size_x, size_y, pad=(0.2, 0.5), *args, **kwar
         Figure width in inches.
     size_y : float
         Figure height in inches.
+    palette : mpl color palette, optional
     pad : tuple of float, optional
         Padding around the subplots.
     *args
@@ -53,6 +54,10 @@ def general_temp(num_row, num_col, size_x, size_y, pad=(0.2, 0.5), *args, **kwar
     """
     fig, axs = plt.subplots(num_row, num_col, figsize=(size_x, size_y), *args, **kwargs)
     plt.subplots_adjust(wspace=pad[0], hspace=pad[1])
+
+    if palette is not None:
+        plt.rcParams['axes.prop_cycle'] = plt.cycler(color=plt.get_cmap(palette).colors)
+        
     if num_row*num_col != 1:
         axs = axs.ravel()
         for ax in axs:
@@ -71,7 +76,7 @@ def general_temp(num_row, num_col, size_x, size_y, pad=(0.2, 0.5), *args, **kwar
     plt.rcParams['lines.linewidth'] = 2.0
     plt.rcParams['scatter.marker'] = 'o'
     plt.rcParams['lines.markersize'] = 6
-    plt.rcParams["savefig.dpi"] = 300
+    plt.rcParams["savefig.dpi"] = 600
 
     return fig, axs
 
