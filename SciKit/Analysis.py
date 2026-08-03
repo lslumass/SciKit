@@ -1636,6 +1636,13 @@ def _parse_components(spec, segids):
     if spec is None:
         return {"A": segids}
 
+    # FIX: guard against malformed tokens with no ':' before indexing t.split(":")[1]
+    for t in spec.split():
+        if ":" not in t:
+            raise ValueError(
+                f"Malformed component token '{t}' — expected 'LABEL:COUNT' or 'LABEL:PATTERN'."
+            )
+
     if any(not t.split(":")[1].isdigit() for t in spec.split()):
         import fnmatch
         comp_map = {}
@@ -1645,7 +1652,21 @@ def _parse_components(spec, segids):
             if not matched:
                 raise ValueError(f"Pattern '{pattern}' matched no segids.")
             comp_map[label] = matched
+
         assigned = sum(comp_map.values(), [])
+
+        # FIX: previously only coverage was checked (set(assigned) == set(segids)),
+        # so two overlapping patterns matching the same segid would silently
+        # double-assign it with no error. Check disjointness explicitly first.
+        if len(assigned) != len(set(assigned)):
+            seen = set()
+            dupes = set()
+            for s in assigned:
+                (dupes if s in seen else seen).add(s)
+            raise ValueError(
+                f"Patterns overlap — segid(s) matched by more than one pattern: {dupes}"
+            )
+
         if set(assigned) != set(segids):
             raise ValueError(
                 f"Patterns do not cover all segids. Unassigned: {set(segids) - set(assigned)}"
@@ -1681,20 +1702,29 @@ def _contacts_worker(args):
     """Optimised subprocess worker for contact-map accumulation.
 
     Key optimisations:
-      1. Per-pair capped_distance — two-group for cross-component, self for
-         same-component — instead of one massive all-vs-all call.
+      1. Per-pair capped_distance — two-group for cross-component, self-capped
+         (single search, not doubled) for same-component — instead of one
+         massive all-vs-all call.
       2. 1D integer packing for np.unique (fast int64 sort) instead of the
          extremely expensive 2D np.unique(..., axis=0).
       3. Pre-split atom arrays by component — zero per-frame filtering overhead.
-      4. For same-component self-distance, only i<j atom pairs are kept then
-         residue indices are explicitly symmetrised, halving raw pair count.
+      4. For same-component contacts, self_capped_distance returns each atom
+         pair exactly once (no i>j duplicate half to discard), then residue
+         indices are explicitly symmetrised, halving both search cost and
+         raw pair count versus a full self,self capped_distance call.
 
     Binary contact semantics are preserved: multiple atom–atom contacts between
     the same residue pair in the same copy-pair count as ONE contact.
     """
     _suppress_warnings()
     import MDAnalysis as mda
-    from MDAnalysis.lib.distances import capped_distance
+    # FIX: use self_capped_distance for the same-component branch instead of
+    # calling capped_distance(pos, pos, ...) and then discarding half the
+    # returned pairs with a mask. self_capped_distance performs the search
+    # once and returns each unordered pair a single time, so this removes
+    # ~2x redundant neighbour-search work on what is typically the largest
+    # component (e.g. protein-protein self contacts).
+    from MDAnalysis.lib.distances import capped_distance, self_capped_distance
 
     (top, traj, cutoff, frame_indices,
      comp_data, pair_specs, sel_str) = args
@@ -1723,23 +1753,24 @@ def _contacts_worker(args):
             key = (cx, cy)
 
             if same:
-                # ═══ Same-component: self capped_distance ═══
+                # ═══ Same-component: self_capped_distance (each pair once) ═══
                 idx_c   = comp_data[cx]["indices"]
                 pos_c   = pos_all[idx_c]
                 local_c = comp_data[cx]["local"]
                 copy_c  = comp_data[cx]["copy"]
                 n_copies = comp_data[cx]["n_copies"]
 
-                pairs_found, _ = capped_distance(
-                    pos_c, pos_c, cutoff, box=box, return_distances=True
+                # FIX: self_capped_distance instead of capped_distance(self, self)
+                # + i<j mask — same result set, ~half the neighbour-search work,
+                # and no reliance on returned-pair ordering.
+                pairs_found, _ = self_capped_distance(
+                    pos_c, cutoff, box=box, return_distances=True
                 )
                 if len(pairs_found) == 0:
                     continue
 
-                # Keep only i < j — each atom contact counted once
-                mask_lt = pairs_found[:, 0] < pairs_found[:, 1]
-                pi = pairs_found[mask_lt, 0].astype(np.intp)
-                pj = pairs_found[mask_lt, 1].astype(np.intp)
+                pi = pairs_found[:, 0].astype(np.intp)
+                pj = pairs_found[:, 1].astype(np.intp)
 
                 li = local_c[pi]
                 lj = local_c[pj]
@@ -1952,7 +1983,10 @@ def cmd_contacts(
     del u  # Free memory before multiprocessing
 
     # ── Multiprocessing setup ──────────────────────────────────────────────
-    frames   = list(range(start, stop or n_traj, stride))
+    # FIX: `stop or n_traj` treats an explicit `--stop 0` as falsy and silently
+    # falls back to n_traj instead of yielding zero frames. Use an explicit
+    # None check instead.
+    frames   = list(range(start, stop if stop is not None else n_traj, stride))
     n_frames = len(frames)
     nprocs   = min(nproc, n_frames)
 
