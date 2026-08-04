@@ -310,56 +310,9 @@ def set_label(axs, starting=1, style=1, x=-0.2, y=1.05, **kwargs):
 
 
 def color_cycle(id):
-    """
-    Return a hex color string from a fixed 10-color palette.
-
-    Mirrors matplotlib's default ``tab10`` color cycle, providing
-    convenient index-based access for consistent multi-series coloring.
-
-    Parameters
-    ----------
-    id : int
-        Color index in the range [1, 10]:
-
-        ====  =========  ===================
-        id    hex        approximate color
-        ====  =========  ===================
-        1     #1f77b4    muted blue
-        2     #ff7f0e    safety orange
-        3     #2ca02c    cooked asparagus green
-        4     #d62728    brick red
-        5     #9467bd    muted purple
-        6     #8c564b    chestnut brown
-        7     #e377c2    raspberry pink
-        8     #7f7f7f    middle gray
-        9     #bcbd22    curry yellow-green
-        10    #17becf    blue-teal
-        ====  =========  ===================
-
-    Returns
-    -------
-    str
-        Hex color string. Returns ``'#000000'`` (black) for any ``id``
-        not in [1, 10].
-
-    Examples
-    --------
-    >>> ax.plot(x, y, color=color_cycle(1))   # muted blue
-    >>> ax.plot(x, z, color=color_cycle(2))   # safety orange
-    """
-    colors = {
-        1 : '#1f77b4',
-        2 : '#ff7f0e',
-        3 : '#2ca02c',
-        4 : '#d62728',
-        5 : '#9467bd',
-        6 : '#8c564b',
-        7 : '#e377c2',
-        8 : '#7f7f7f',
-        9 : '#bcbd22',
-        10: '#17becf',
-    }
-    return colors.get(id, '#000000')
+    current_cycler = plt.rcParams['axes.prop_cycle']
+    current_colors = current_cycler.by_key()['color']
+    return current_colors[id % len(current_colors)]
 
 def tcolor(color, alpha=0.5):
     """
