@@ -5950,6 +5950,208 @@ def cmd_saxs(
         _shutil.rmtree(tmp_root, ignore_errors=True)
 
 
+# =============================================================================
+#  ░░  14.  Persistence length (Lp)  ░░
+# =============================================================================
+
+def _lp_worker(args: tuple):
+    """Subprocess worker: compute persistence length (+ block error) for ONE segment.
+
+    Splits the requested frame range into two contiguous blocks, runs
+    MDAnalysis' ``polymer.PersistenceLength`` independently on each block,
+    and reports the block-averaged Lp with the standard error between the
+    two blocks.
+
+    Note:
+        Atoms are ordered by MDAnalysis' default index order from
+        ``select_atoms``, not re-sorted along the chain. This is correct
+        as long as topology atom indices for the segment already run in
+        backbone sequence order (true for standard PSF/PDB builds). If
+        your topology was reordered/renumbered, verify chain order before
+        trusting Lp values.
+
+    Args:
+        args (tuple): Packed argument tuple:
+
+            - **topology** (*str*) — Path to the topology file.
+            - **trajectory** (*str*) — Path to the trajectory file.
+            - **segid** (*str*) — Segment id to analyse.
+            - **ref_atom** (*str*) — Backbone atom name to select (e.g. ``"P"``
+              for RNA, ``"CA"`` for protein).
+            - **start** (*int*) — First absolute trajectory frame.
+            - **mid** (*int*) — Frame index separating block 1 / block 2.
+            - **stop** (*int*) — One-past-last absolute trajectory frame.
+            - **stride** (*int*) — Step between analysed frames.
+
+    Returns:
+        Optional[tuple[str, float, float]]: ``(segid, lp, error)`` — Lp and
+        its block-to-block standard error in ångström — or ``None`` if the
+        segment couldn't be analysed (too few backbone atoms, or a fit
+        failure in both blocks).
+    """
+    _suppress_warnings()
+    import MDAnalysis as mda
+    from MDAnalysis.analysis import polymer
+
+    topology, trajectory, segid, ref_atom, start, mid, stop, stride = args
+
+    u = mda.Universe(topology, trajectory)
+    backbone = u.select_atoms(f"segid {segid} and name {ref_atom}")
+    if len(backbone) < 4:
+        # Need enough backbone atoms/bonds for a meaningful exponential fit
+        return None
+
+    lps = []
+    for blk_start, blk_stop in ((start, mid), (mid, stop)):
+        if blk_stop <= blk_start:
+            continue
+        try:
+            plen = polymer.PersistenceLength([backbone])
+            plen.run(start=blk_start, stop=blk_stop, step=stride)
+            lp_val = getattr(plen.results, "lp", None)
+            if lp_val is None:
+                lp_val = getattr(plen, "lp", None)  # older MDAnalysis fallback
+            if lp_val is not None and np.isfinite(lp_val):
+                lps.append(float(lp_val))
+        except Exception:
+            continue
+
+    if not lps:
+        return None
+
+    lp_mean = float(np.mean(lps))
+    error   = float(np.std(lps, ddof=1) / np.sqrt(len(lps))) if len(lps) > 1 else 0.0
+
+    return (segid, lp_mean, error)
+
+
+@app.command("lp")
+def cmd_lp(
+    top:    Annotated[str, typer.Option("--top")]    = "conf.psf",
+    traj:   Annotated[str, typer.Option("--traj")]   = "system.xtc",
+    sel:    Annotated[Optional[str], typer.Option(
+                "--sel",
+                help="Segment selection (e.g. R001, R001-R010, or R001,R003-R006,R010)."
+                     " Omit to use all segments.",
+            )] = None,
+    ref:    Annotated[str, typer.Option(
+                "--ref",
+                help="Backbone atom name used for every segment: 'P' for RNA, 'CA' for protein.",
+            )] = "P",
+    out:    Annotated[str, typer.Option("--out",    help="Output file")] = "lp.dat",
+    start:  Annotated[int, typer.Option("--start")]  = 0,
+    stop:   Annotated[int, typer.Option("--stop")]   = -1,
+    stride: Annotated[int, typer.Option("--stride")] = 10,
+    nproc:  Annotated[int, typer.Option("--nproc")]  = 4,
+):
+    """Calculate per-segment **persistence length** with a block-averaged error bar.
+
+    For each selected segment, atoms named ``--ref`` (e.g. ``P`` for RNA,
+    ``CA`` for protein) are taken as the backbone and passed to
+    MDAnalysis' ``polymer.PersistenceLength``. The requested frame range is
+    split into two contiguous blocks; Lp is computed independently on each
+    block and the two estimates are combined into a mean and a standard
+    error.
+
+    Parallelism strategy
+    ---------------------
+    Unlike ``rg`` (parallel over frames), this command parallelises
+    **over segments**: each worker owns exactly one segment, opens one
+    Universe, and runs both blocks sequentially. This is required because
+    ``PersistenceLength`` needs a contiguous run of frames to build its
+    bond-vector autocorrelation — frames can't be distributed round-robin
+    the way they are for the (frame-independent) Rg calculation.
+
+    Args:
+        top (str): Path to the topology file.
+        traj (str): Path to the trajectory file.
+        sel (Optional[str]): Segment selection string.
+        ref (str): Backbone atom name, e.g. ``"P"`` or ``"CA"``.
+        out (str): Path for the output ``.dat`` file.
+        start (int): Index of the first trajectory frame.
+        stop (int): Index of the last trajectory frame; ``-1`` means end.
+        stride (int): Step between analysed frames.
+        nproc (int): Number of parallel worker processes.
+
+    Output:
+        ``<out>`` — three columns: ``segment  lp  error``.
+        Units: Lp and error in ångström.
+
+    Example::
+
+        scical lp --top conf.psf --traj system.xtc --sel R001-R500 \\
+            --ref P --out lp.dat --stride 1 --nproc 40
+    """
+    _suppress_warnings()
+
+    u = _load_universe(top, traj)
+
+    try:
+        sel_indices = _parse_sel(sel, u)
+    except ValueError as exc:
+        typer.echo(f"[!] {exc}", err=True)
+        raise typer.Exit(1)
+
+    segids = [u.segments[i].segid for i in sel_indices]
+
+    if not segids:
+        typer.echo("[!] No segments found.", err=True)
+        raise typer.Exit(1)
+
+    effective_stop = _traj_stop(stop)
+    mid = start + (effective_stop - start) // 2
+
+    # Count *actual sampled* frames per block (respecting stride), not raw
+    # frames — a large --stride can starve a block of real sample points
+    # even when the raw frame count looks fine.
+    n_block1 = len(range(*slice(start, mid, stride).indices(10**9)))
+    n_block2 = len(range(*slice(mid, effective_stop, stride).indices(10**9)))
+
+    if n_block1 < 3 or n_block2 < 3:
+        typer.echo(
+            f"[!] Too few sampled frames per block (block1={n_block1}, block2={n_block2}) "
+            f"for a stable Lp fit — reduce --stride or widen --start/--stop.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    n_workers = min(nproc, len(segids))
+
+    typer.echo(f"[i] Segments : {len(segids)} ({segids[0]} … {segids[-1]})")
+    typer.echo(f"[i] Ref atom : {ref}")
+    typer.echo(f"[i] Blocks   : [{start}:{mid}) n={n_block1}  /  [{mid}:{effective_stop}) n={n_block2}  (step {stride})")
+    typer.echo(f"[i] Workers  : {n_workers} (segment-parallel)")
+    del u
+
+    worker_args = [
+        (top, traj, segid, ref, start, mid, effective_stop, stride)
+        for segid in segids
+    ]
+
+    if n_workers == 1:
+        raw_results = [_lp_worker(a) for a in worker_args]
+    else:
+        with Pool(n_workers) as pool:
+            raw_results = pool.map(_lp_worker, worker_args)
+
+    rows = [r for r in raw_results if r is not None]
+    skipped = len(segids) - len(rows)
+
+    if not rows:
+        typer.echo("[!] No valid results — nothing written.", err=True)
+        return
+
+    W = 14
+    with open(out, "w") as fh:
+        fh.write("# segment, lp, error\n")
+        for segid, lp, error in rows:
+            fh.write(f"{segid:>{W}} {lp:{W}.6f} {error:{W}.6f}\n")
+
+    msg = f"[+] Lp saved -> {out}  ({len(rows)} segments)"
+    if skipped:
+        msg += f"  [{skipped} segment(s) skipped: fewer than 4 '{ref}' atoms or fit failure]"
+    typer.echo(msg)
+
     
 # =============================================================================
 #  ░░  Entry-point  ░░
