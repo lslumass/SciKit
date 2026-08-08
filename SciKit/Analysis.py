@@ -5953,22 +5953,96 @@ def cmd_saxs(
 # =============================================================================
 #  ░░  14.  Persistence length (Lp)  ░░
 # =============================================================================
+#
+# NOTE: this bypasses MDAnalysis.analysis.polymer.PersistenceLength's own
+# run(start=, stop=) frame-subsetting. On at least one installed version,
+# passing start/stop to .run() produces a bond_autocorrelation array that is
+# divided by the FULL trajectory length instead of the number of frames
+# actually processed — confirmed empirically:
+#
+#   500 frames of 50000   -> bond_autocorrelation[0] = 0.01  (=  500/50000)
+#   25000 frames of 50000 -> bond_autocorrelation[0] = 0.50  (=25000/50000)
+#   50000 frames of 50000 -> bond_autocorrelation[0] = 1.00  (=50000/50000)
+#
+# i.e. correct only when processing the ENTIRE trajectory (numerator ==
+# denominator). 
+# When run() is given a partial start/stop range, the entire results.bond_autocorrelation
+# curve — not just the x=0 point — comes out uniformly rescaled by 
+# n_frames_processed / n_frames_total_trajectory, rather than correctly normalized
+# by the number of frames actually processed.
+
+def _persistence_fit(positions_per_frame: "np.ndarray"):
+    """Compute bond-vector autocorrelation and fit persistence length.
+
+    Reimplements the same C(n) / exponential-fit math as MDAnalysis'
+    ``polymer.PersistenceLength``, but normalizes using the true number of
+    frames passed in (see module note above on why the built-in
+    ``run(start=, stop=)`` path can't be trusted for partial ranges).
+
+    Args:
+        positions_per_frame (np.ndarray): Shape ``(n_frames, n_atoms, 3)``
+            — backbone atom coordinates for each frame to include in the fit.
+
+    Returns:
+        Optional[tuple[float, float, float]]: ``(lp, lp_stderr, lb)`` — the
+        fitted persistence length, its standard error from the fit
+        covariance, and the mean bond length (all in ångström) — or
+        ``None`` if the fit fails.
+    """
+    import numpy as np
+    from scipy.optimize import curve_fit
+
+    n_frames, n_atoms, _ = positions_per_frame.shape
+    n_bonds = n_atoms - 1
+    if n_bonds < 3 or n_frames < 2:
+        return None
+
+    accum = np.zeros(n_bonds, dtype=np.float64)
+    bond_lengths = []
+
+    for f in range(n_frames):
+        pos = positions_per_frame[f]
+        vecs = pos[1:] - pos[:-1]
+        lens = np.linalg.norm(vecs, axis=1)
+        if np.any(lens == 0):
+            continue
+        bond_lengths.append(lens.mean())
+        unit_vecs = vecs / lens[:, None]
+        inner_pr = unit_vecs @ unit_vecs.T
+        for i in range(n_bonds):
+            accum[: n_bonds - i] += inner_pr[i, i:]
+
+    if not bond_lengths:
+        return None
+
+    # Normalize by the count of (i, i+k) pairs at each separation k,
+    # summed over the frames we actually used — this is the step that
+    # was silently wrong in the library call.
+    norm = np.linspace(n_bonds, 1, n_bonds) * len(bond_lengths)
+    bond_autocorr = accum / norm
+    lb_mean = float(np.mean(bond_lengths))
+
+    def model(n, lp):
+        return np.exp(-n * lb_mean / lp)
+
+    try:
+        popt, pcov = curve_fit(
+            model, np.arange(n_bonds), bond_autocorr, p0=[5.0], maxfev=5000
+        )
+        lp = float(popt[0])
+        lp_err = float(np.sqrt(pcov[0, 0])) if np.isfinite(pcov[0, 0]) else 0.0
+    except Exception:
+        return None
+
+    return lp, lp_err, lb_mean
+
 
 def _lp_worker(args: tuple):
-    """Subprocess worker: compute persistence length (+ block error) for ONE segment.
+    """Subprocess worker: compute persistence length (+ fit error) for ONE segment.
 
-    Splits the requested frame range into two contiguous blocks, runs
-    MDAnalysis' ``polymer.PersistenceLength`` independently on each block,
-    and reports the block-averaged Lp with the standard error between the
-    two blocks.
-
-    Note:
-        Atoms are ordered by MDAnalysis' default index order from
-        ``select_atoms``, not re-sorted along the chain. This is correct
-        as long as topology atom indices for the segment already run in
-        backbone sequence order (true for standard PSF/PDB builds). If
-        your topology was reordered/renumbered, verify chain order before
-        trusting Lp values.
+    Loads backbone coordinates for the requested frames directly (bypassing
+    ``PersistenceLength.run(start=, stop=)``, see module note above) and
+    fits Lp via :func:`_persistence_fit`.
 
     Args:
         args (tuple): Packed argument tuple:
@@ -5976,54 +6050,36 @@ def _lp_worker(args: tuple):
             - **topology** (*str*) — Path to the topology file.
             - **trajectory** (*str*) — Path to the trajectory file.
             - **segid** (*str*) — Segment id to analyse.
-            - **ref_atom** (*str*) — Backbone atom name to select (e.g. ``"P"``
-              for RNA, ``"CA"`` for protein).
-            - **start** (*int*) — First absolute trajectory frame.
-            - **mid** (*int*) — Frame index separating block 1 / block 2.
-            - **stop** (*int*) — One-past-last absolute trajectory frame.
-            - **stride** (*int*) — Step between analysed frames.
+            - **ref_atom** (*str*) — Backbone atom name to select.
+            - **frame_indices** (*list[int]*) — Absolute trajectory frame
+              indices to include.
 
     Returns:
-        Optional[tuple[str, float, float]]: ``(segid, lp, error)`` — Lp and
-        its block-to-block standard error in ångström — or ``None`` if the
-        segment couldn't be analysed (too few backbone atoms, or a fit
-        failure in both blocks).
+        Optional[tuple[str, float, float]]: ``(segid, lp, error)`` in
+        ångström, or ``None`` if the segment couldn't be analysed.
     """
     _suppress_warnings()
     import numpy as np
     import MDAnalysis as mda
-    from MDAnalysis.analysis import polymer
 
-    topology, trajectory, segid, ref_atom, start, mid, stop, stride = args
+    topology, trajectory, segid, ref_atom, frame_indices = args
 
     u = mda.Universe(topology, trajectory)
     backbone = u.select_atoms(f"segid {segid} and name {ref_atom}")
     if len(backbone) < 4:
-        # Need enough backbone atoms/bonds for a meaningful exponential fit
         return None
 
-    lps = []
-    for blk_start, blk_stop in ((start, mid), (mid, stop)):
-        if blk_stop <= blk_start:
-            continue
-        try:
-            plen = polymer.PersistenceLength([backbone])
-            plen.run(start=blk_start, stop=blk_stop, step=stride)
-            lp_val = getattr(plen.results, "lp", None)
-            if lp_val is None:
-                lp_val = getattr(plen, "lp", None)  # older MDAnalysis fallback
-            if lp_val is not None and np.isfinite(lp_val):
-                lps.append(float(lp_val))
-        except Exception:
-            continue
+    positions = np.empty((len(frame_indices), len(backbone), 3), dtype=np.float64)
+    for i, fidx in enumerate(frame_indices):
+        u.trajectory[fidx]
+        positions[i] = backbone.positions
 
-    if not lps:
+    result = _persistence_fit(positions)
+    if result is None:
         return None
 
-    lp_mean = float(np.mean(lps))
-    error   = float(np.std(lps, ddof=1) / np.sqrt(len(lps))) if len(lps) > 1 else 0.0
-
-    return (segid, lp_mean, error)
+    lp, lp_err, _lb = result
+    return (segid, lp, lp_err)
 
 
 @app.command("lp")
@@ -6042,26 +6098,25 @@ def cmd_lp(
     out:    Annotated[str, typer.Option("--out",    help="Output file")] = "lp.dat",
     start:  Annotated[int, typer.Option("--start")]  = 0,
     stop:   Annotated[int, typer.Option("--stop")]   = -1,
-    stride: Annotated[int, typer.Option("--stride")] = 10,
+    stride: Annotated[int, typer.Option("--stride")] = 1,
     nproc:  Annotated[int, typer.Option("--nproc")]  = 4,
 ):
-    """Calculate per-segment **persistence length** with a block-averaged error bar.
+    """Calculate per-segment **persistence length** with a fit-based error bar.
 
     For each selected segment, atoms named ``--ref`` (e.g. ``P`` for RNA,
-    ``CA`` for protein) are taken as the backbone and passed to
-    MDAnalysis' ``polymer.PersistenceLength``. The requested frame range is
-    split into two contiguous blocks; Lp is computed independently on each
-    block and the two estimates are combined into a mean and a standard
-    error.
+    ``CA`` for protein) are taken as the backbone. The bond-vector
+    autocorrelation and exponential-decay fit are computed manually (see
+    module note in the source) rather than via
+    ``MDAnalysis.analysis.polymer.PersistenceLength.run(start=, stop=)``,
+    which was found to silently mis-normalize partial-trajectory ranges on
+    at least one MDAnalysis version. The reported error is the standard
+    error of the fitted Lp from the exponential fit's own covariance —
+    no block-splitting or bootstrapping needed.
 
     Parallelism strategy
     ---------------------
-    Unlike ``rg`` (parallel over frames), this command parallelises
-    **over segments**: each worker owns exactly one segment, opens one
-    Universe, and runs both blocks sequentially. This is required because
-    ``PersistenceLength`` needs a contiguous run of frames to build its
-    bond-vector autocorrelation — frames can't be distributed round-robin
-    the way they are for the (frame-independent) Rg calculation.
+    Parallelised over segments: each worker owns one segment, loads its
+    backbone coordinates for the requested frames, and fits once.
 
     Args:
         top (str): Path to the topology file.
@@ -6081,7 +6136,7 @@ def cmd_lp(
     Example::
 
         scical lp --top conf.psf --traj system.xtc --sel R001-R500 \\
-            --ref P --out lp.dat --stride 1 --nproc 40
+            --ref P --out lp.dat --nproc 40
     """
     _suppress_warnings()
 
@@ -6094,7 +6149,6 @@ def cmd_lp(
         raise typer.Exit(1)
 
     segids = [u.segments[i].segid for i in sel_indices]
-
     if not segids:
         typer.echo("[!] No segments found.", err=True)
         raise typer.Exit(1)
@@ -6103,22 +6157,13 @@ def cmd_lp(
     if effective_stop is None:
         effective_stop = len(u.trajectory)
 
-    if start >= effective_stop:
+    frame_indices = list(
+        range(*slice(start, effective_stop, stride).indices(len(u.trajectory)))
+    )
+    if len(frame_indices) < 10:
         typer.echo(
-            f"[!] --start ({start}) must be before the resolved --stop ({effective_stop}).",
-            err=True,
-        )
-        raise typer.Exit(1)
-
-    mid = start + (effective_stop - start) // 2
-
-    n_block1 = len(range(*slice(start, mid, stride).indices(10**9)))
-    n_block2 = len(range(*slice(mid, effective_stop, stride).indices(10**9)))
-
-    if n_block1 < 3 or n_block2 < 3:
-        typer.echo(
-            f"[!] Too few sampled frames per block (block1={n_block1}, block2={n_block2}) "
-            f"for a stable Lp fit — reduce --stride or widen --start/--stop.",
+            f"[!] Only {len(frame_indices)} frames in range — too few for a "
+            f"stable Lp fit. Widen --start/--stop or reduce --stride.",
             err=True,
         )
         raise typer.Exit(1)
@@ -6127,12 +6172,12 @@ def cmd_lp(
 
     typer.echo(f"[i] Segments : {len(segids)} ({segids[0]} … {segids[-1]})")
     typer.echo(f"[i] Ref atom : {ref}")
-    typer.echo(f"[i] Blocks   : [{start}:{mid}) n={n_block1}  /  [{mid}:{effective_stop}) n={n_block2}  (step {stride})")
-    typer.echo(f"[i] Workers  : {n_workers} (segment-parallel)")
+    typer.echo(f"[i] Frames   : {len(frame_indices)} [{start}:{effective_stop}) step {stride}")
+    typer.echo(f"[i] Workers  : {n_workers} (segment-parallel, manual fit — bypasses MDAnalysis run(start=,stop=))")
     del u
 
     worker_args = [
-        (top, traj, segid, ref, start, mid, effective_stop, stride)
+        (top, traj, segid, ref, frame_indices)
         for segid in segids
     ]
 
