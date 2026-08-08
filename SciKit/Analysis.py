@@ -5990,6 +5990,7 @@ def _lp_worker(args: tuple):
         failure in both blocks).
     """
     _suppress_warnings()
+    import numpy as np
     import MDAnalysis as mda
     from MDAnalysis.analysis import polymer
 
@@ -6099,11 +6100,18 @@ def cmd_lp(
         raise typer.Exit(1)
 
     effective_stop = _traj_stop(stop)
+    if effective_stop is None:
+        effective_stop = len(u.trajectory)
+
+    if start >= effective_stop:
+        typer.echo(
+            f"[!] --start ({start}) must be before the resolved --stop ({effective_stop}).",
+            err=True,
+        )
+        raise typer.Exit(1)
+
     mid = start + (effective_stop - start) // 2
 
-    # Count *actual sampled* frames per block (respecting stride), not raw
-    # frames — a large --stride can starve a block of real sample points
-    # even when the raw frame count looks fine.
     n_block1 = len(range(*slice(start, mid, stride).indices(10**9)))
     n_block2 = len(range(*slice(mid, effective_stop, stride).indices(10**9)))
 
