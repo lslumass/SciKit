@@ -6118,10 +6118,12 @@ def _persistence_fit(positions_per_frame: "np.ndarray"):
             — backbone atom coordinates for each frame to include in the fit.
 
     Returns:
-        Optional[tuple[float, float, float]]: ``(lp, lp_stderr, lb)`` — the
-        fitted persistence length, its standard error from the fit
-        covariance, and the mean bond length (all in ångström) — or
-        ``None`` if the fit fails.
+        Optional[tuple[float, float, float, np.ndarray, np.ndarray]]:
+        ``(lp, lp_stderr, lb, lag, bond_autocorr)`` — the fitted
+        persistence length, its standard error from the fit covariance,
+        the mean bond length (all in ångström), the contour-separation
+        lag values in bond units (``0, 1, 2, ...``), and the raw measured
+        autocorrelation ``C(lag)`` — or ``None`` if the fit fails.
     """
     import numpy as np
     from scipy.optimize import curve_fit
@@ -6155,20 +6157,21 @@ def _persistence_fit(positions_per_frame: "np.ndarray"):
     norm = np.linspace(n_bonds, 1, n_bonds) * len(bond_lengths)
     bond_autocorr = accum / norm
     lb_mean = float(np.mean(bond_lengths))
+    lag = np.arange(n_bonds)  # contour separation, in bond units
 
     def model(n, lp):
         return np.exp(-n * lb_mean / lp)
 
     try:
         popt, pcov = curve_fit(
-            model, np.arange(n_bonds), bond_autocorr, p0=[5.0], maxfev=5000
+            model, lag, bond_autocorr, p0=[5.0], maxfev=5000
         )
         lp = float(popt[0])
         lp_err = float(np.sqrt(pcov[0, 0])) if np.isfinite(pcov[0, 0]) else 0.0
     except Exception:
         return None
 
-    return lp, lp_err, lb_mean
+    return lp, lp_err, lb_mean, lag, bond_autocorr
 
 
 def _lp_worker(args: tuple):
@@ -6189,8 +6192,10 @@ def _lp_worker(args: tuple):
               indices to include.
 
     Returns:
-        Optional[tuple[str, float, float]]: ``(segid, lp, error)`` in
-        ångström, or ``None`` if the segment couldn't be analysed.
+        Optional[tuple[str, float, float, np.ndarray, np.ndarray]]:
+        ``(segid, lp, error, lag, bond_autocorr)`` — Lp and its fit error
+        in ångström, plus the raw ``lag``/``C(lag)`` arrays used for the
+        fit — or ``None`` if the segment couldn't be analysed.
     """
     _suppress_warnings()
     import numpy as np
@@ -6212,8 +6217,8 @@ def _lp_worker(args: tuple):
     if result is None:
         return None
 
-    lp, lp_err, _lb = result
-    return (segid, lp, lp_err)
+    lp, lp_err, _lb, lag, bond_autocorr = result
+    return (segid, lp, lp_err, lag, bond_autocorr)
 
 
 @app.command("lp")
@@ -6230,6 +6235,10 @@ def cmd_lp(
                 help="Backbone atom name used for every segment: 'P' for RNA, 'CA' for protein.",
             )] = "P",
     out:    Annotated[str, typer.Option("--out",    help="Output file")] = "lp.dat",
+    corr_out: Annotated[str, typer.Option(
+                "--corr-out",
+                help="Output file for the raw bond-vector autocorrelation curves.",
+            )] = "lp_corr.dat",
     start:  Annotated[int, typer.Option("--start")]  = 0,
     stop:   Annotated[int, typer.Option("--stop")]   = -1,
     stride: Annotated[int, typer.Option("--stride")] = 1,
@@ -6247,6 +6256,11 @@ def cmd_lp(
     error of the fitted Lp from the exponential fit's own covariance —
     no block-splitting or bootstrapping needed.
 
+    In addition to the fitted ``lp``/``error`` per segment, the raw
+    bond-vector autocorrelation curve C(lag) that went into each fit is
+    written to ``--corr-out``, one column per segment, so the underlying
+    decay curves can be inspected or re-fit independently.
+
     Parallelism strategy
     ---------------------
     Parallelised over segments: each worker owns one segment, loads its
@@ -6257,22 +6271,26 @@ def cmd_lp(
         traj (str): Path to the trajectory file.
         sel (Optional[str]): Segment selection string.
         ref (str): Backbone atom name, e.g. ``"P"`` or ``"CA"``.
-        out (str): Path for the output ``.dat`` file.
+        out (str): Path for the fitted Lp output ``.dat`` file.
+        corr_out (str): Path for the raw correlation-curve output ``.dat`` file.
         start (int): Index of the first trajectory frame.
         stop (int): Index of the last trajectory frame; ``-1`` means end.
         stride (int): Step between analysed frames.
         nproc (int): Number of parallel worker processes.
 
     Output:
-        ``<out>`` — three columns: ``segment  lp  error``.
-        Units: Lp and error in ångström.
+        ``<out>`` — three columns: ``segment  lp  error`` (Å).
+        ``<corr_out>`` — ``lag  C_<segid1>  C_<segid2>  …`` (lag in bond
+        units; segments with fewer bonds than the longest segment are
+        padded with ``nan`` past their own chain length).
 
     Example::
 
         scical lp --top conf.psf --traj system.xtc --sel R001-R500 \\
-            --ref P --out lp.dat --nproc 40
+            --ref P --out lp.dat --corr-out lp_corr.dat --nproc 40
     """
     _suppress_warnings()
+    import numpy as np
 
     u = _load_universe(top, traj)
 
@@ -6328,13 +6346,35 @@ def cmd_lp(
         typer.echo("[!] No valid results — nothing written.", err=True)
         return
 
+    # ── Write fitted Lp values ───────────────────────────────────────────
     W = 14
     with open(out, "w") as fh:
         fh.write("# segment, lp, error\n")
-        for segid, lp, error in rows:
+        for segid, lp, error, _lag, _corr in rows:
             fh.write(f"{segid:>{W}} {lp:{W}.6f} {error:{W}.6f}\n")
 
-    msg = f"[+] Lp saved -> {out}  ({len(rows)} segments)"
+    # ── Write raw correlation curves: lag, C_seg1, C_seg2, … ─────────────
+    max_len = max(len(lag) for _s, _l, _e, lag, _c in rows)
+    lag_col = np.arange(max_len)
+    corr_cols = []
+    for _segid, _lp, _err, lag, corr in rows:
+        padded = np.full(max_len, np.nan)
+        padded[: len(corr)] = corr
+        corr_cols.append(padded)
+
+    corr_data = np.column_stack([lag_col] + corr_cols)
+    corr_header = " ".join(
+        [f"{'lag':>{W - 2}}"] + [f"C_{segid:>{W-2}}" for segid, *_ in rows]
+    )
+    np.savetxt(
+        corr_out, corr_data, header=corr_header,
+        fmt=[f"%{W}.0f"] + [f"%{W}.6f"] * len(rows),
+    )
+
+    msg = (
+        f"[+] Lp saved -> {out}  ({len(rows)} segments)  |  "
+        f"raw correlation curves -> {corr_out}"
+    )
     if skipped:
         msg += f"  [{skipped} segment(s) skipped: fewer than 4 '{ref}' atoms or fit failure]"
     typer.echo(msg)
