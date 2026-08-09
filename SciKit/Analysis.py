@@ -5213,39 +5213,52 @@ def _ocf_worker(args: tuple):
     """Subprocess worker: compute the orientational correlation function (OCF)
     for one chain segment.
 
-    The OCF measures how quickly bond-vector orientational memory decays along
-    the backbone of a single chain.  For a chain with *N* reference atoms
-    there are *N − 1* bond vectors **b**_i = (r_{i+1} − r_i) / |r_{i+1} − r_i|.
-    The OCF at bond-index lag *k* (k = 1 … N−2) is:
+    Supports two modes for defining bond vectors along a nucleic-acid chain:
+
+    **OCF mode** (``mode="ocf"``):
+        Uses consecutive backbone phosphorus (P) atoms to form bond vectors:
+
+        .. math::
+
+            \\mathbf{b}_i = \\frac{\\mathbf{r}_{P_{i+1}} - \\mathbf{r}_{P_i}}
+                           {|\\mathbf{r}_{P_{i+1}} - \\mathbf{r}_{P_i}|}
+
+        For a chain with *N* P atoms there are *N − 1* bond vectors.  The OCF
+        is computed for lags *k* = 1 … *N* − 2 (need at least 2 vectors to
+        form one pair).
+
+    **BOCF mode** (``mode="bocf"``):
+        Uses the glycosidic bond direction from the CG sugar bead (C1) to the
+        CG nucleobase bead (NA) within each nucleotide residue:
+
+        .. math::
+
+            \\mathbf{b}_i = \\frac{\\mathbf{r}_{\\mathrm{NA}_i}
+                           - \\mathbf{r}_{\\mathrm{C1}_i}}
+                           {|\\mathbf{r}_{\\mathrm{NA}_i}
+                           - \\mathbf{r}_{\\mathrm{C1}_i}|}
+
+        For a chain with *N* valid residues (containing both C1 and NA) there
+        are *N* bond vectors.  The OCF is computed for lags *k* = 1 … *N* − 1
+        (need at least 2 residues).
+
+    In both modes the OCF at bond-index lag *k* is:
 
     .. math::
 
         C(k) = \\left\\langle \\mathbf{b}_i \\cdot \\mathbf{b}_{i+k}
                \\right\\rangle_{i,\\,\\text{frames}}
 
-    where the average runs over all valid pairs (i, i+k) within every
-    analysed frame.  This exactly mirrors the double-loop in the original
-    script::
-
-        for i in range(len(bds) - 1):
-            for j in range(i + 1, len(bds)):
-                ij = j - i            # lag 1 … N-2
-                ocfs[ij] += dot(bds[i], bds[j])
-
-    Lag-0 (always 1.0, trivial self-dot) is never accumulated.  The maximum
-    lag is *N−2* (not *N−1*) because the outer loop runs only to
-    ``len(bds) - 1``.
-
     The worker opens its own independent Universe (one per subprocess) to
-    avoid pickling issues.  A numpy-vectorised inner loop replaces the
-    original Python double loop over atoms.
+    avoid pickling issues.  A numpy-vectorised inner loop replaces a naive
+    Python double loop over atoms.
 
     Args:
         args (tuple): A packed argument tuple containing:
 
             - **segid** (*str*) — Segment identifier (e.g. ``"R001"``).
-            - **ref_atom** (*str*) — Atom name used to trace the backbone
-              (e.g. ``"CA"`` for proteins, ``"P"`` for nucleic acids/lipids).
+            - **mode** (*str*) — ``"ocf"`` for backbone P–P vectors or
+              ``"bocf"`` for glycosidic C1→NA vectors.
             - **topology** (*str*) — Path to the topology file.
             - **trajectory** (*str*) — Path to the trajectory file.
             - **start** (*int*) — First frame index (inclusive).
@@ -5254,84 +5267,163 @@ def _ocf_worker(args: tuple):
 
     Returns:
         tuple[str, Optional[np.ndarray]]:
-            ``(segid, ocf_array)`` where *ocf_array* has shape ``(N-2,)``
-            containing C(1) … C(N-2) in ascending lag order, matching the
-            values written by the original script's normalisation loop
-            ``ocfs[1] … ocfs[natom-2]``.
+            ``(segid, ocf_array)`` where *ocf_array* has shape ``(n_lags,)``
+            containing C(1) … C(n_lags) in ascending lag order.
+
+            - OCF mode:  n_lags = N_P − 2  (N_P = number of P atoms).
+            - BOCF mode: n_lags = N_res − 1 (N_res = valid residues with
+              both C1 and NA).
+
             Returns ``(segid, None)`` if the atom selection is empty, the
-            chain has fewer than 3 reference atoms (need at least 2 bond
-            vectors to form one lag-1 pair), or the trajectory slice is empty.
+            chain has too few atoms/residues, or the trajectory slice is empty.
     """
     _suppress_warnings()
     import MDAnalysis as mda
 
-    segid, ref_atom, topology, trajectory, start, stop, stride = args
-    u   = mda.Universe(topology, trajectory)
-    sel = u.select_atoms(f"segid {segid} and name {ref_atom}")
+    segid, mode, topology, trajectory, start, stop, stride = args
+    u = mda.Universe(topology, trajectory)
 
-    if len(sel.atoms) == 0:
+    if mode == "ocf":
+        # ================================================================
+        # MODE: ocf -- consecutive backbone P atom bond vectors
+        # ================================================================
+        sel = u.select_atoms(f"segid {segid} and name P")
+
+        if len(sel.atoms) == 0:
+            typer.echo(
+                f"  [!] Segment {segid}: no atoms match 'name P' — skipped.",
+                err=True,
+            )
+            return segid, None
+
+        natom = len(sel.atoms)
+        nbond = natom - 1
+
+        if nbond < 2:
+            typer.echo(
+                f"  [!] Segment {segid}: only {natom} P atom(s) — need ≥ 3 "
+                f"to form at least one lag-1 pair.",
+                err=True,
+            )
+            return segid, None
+
+        n_lags  = nbond - 1
+        ocf_sum = np.zeros(n_lags, dtype=np.float64)
+        count   = np.zeros(n_lags, dtype=np.int64)
+
+        n_frames = 0
+        for _ts in u.trajectory[start : _traj_stop(stop) : stride]:
+            pos  = sel.positions
+            diff = pos[1:] - pos[:-1]
+            nrm  = np.linalg.norm(diff, axis=1, keepdims=True)
+            nrm  = np.where(nrm == 0.0, 1.0, nrm)
+            bds  = diff / nrm
+
+            for k in range(1, nbond):
+                dots = np.einsum("ij,ij->i", bds[: nbond - k], bds[k:])
+                ocf_sum[k - 1] += dots.sum()
+                count[k - 1]   += len(dots)
+
+            n_frames += 1
+
+        if n_frames == 0:
+            typer.echo(
+                f"  [!] Segment {segid}: trajectory slice is empty — skipped.",
+                err=True,
+            )
+            return segid, None
+
+        ocf = ocf_sum / count
         typer.echo(
-            f"  [!] Segment {segid}: no atoms match 'name {ref_atom}' — skipped.",
-            err=True,
+            f"  [+] Segment {segid}: {natom} atoms, {n_lags} lags, {n_frames} frames"
         )
-        return segid, None
+        return segid, ocf
 
-    natom = len(sel.atoms)   # number of ref atoms in this chain
-    nbond = natom - 1        # number of bond vectors  (= len(bds) in original)
+    else:
+        # ================================================================
+        # MODE: bocf -- C1 → NA bond vectors (CG model)
+        # ================================================================
+        seg_atoms = u.select_atoms(f"segid {segid}")
+        if len(seg_atoms) == 0:
+            typer.echo(
+                f"  [!] Segment {segid}: no atoms found — skipped.",
+                err=True,
+            )
+            return segid, None
 
-    # Need at least 2 bond vectors to form one pair at lag 1.
-    # Original: range(len(bds)-1) requires len(bds) >= 2 i.e. natom >= 3.
-    if nbond < 2:
+        residues = seg_atoms.residues
+
+        c1_indices = []
+        na_indices = []
+
+        for res in residues:
+            c1_sel = res.atoms.select_atoms("name C1")
+            if len(c1_sel) == 0:
+                continue
+
+            na_sel = res.atoms.select_atoms("name NA")
+            if len(na_sel) == 0:
+                continue
+
+            c1_indices.append(c1_sel[0].index)
+            na_indices.append(na_sel[0].index)
+
+        n_residues = len(c1_indices)
+
+        if n_residues == 0:
+            typer.echo(
+                f"  [!] Segment {segid}: no residues with both C1 and "
+                f"NA atoms — skipped.",
+                err=True,
+            )
+            return segid, None
+
+        if n_residues < 2:
+            typer.echo(
+                f"  [!] Segment {segid}: only {n_residues} valid residue(s) — "
+                f"need ≥ 2 for at least one lag-1 pair.",
+                err=True,
+            )
+            return segid, None
+
+        c1_indices = np.array(c1_indices, dtype=np.intp)
+        na_indices = np.array(na_indices, dtype=np.intp)
+
+        n_lags  = n_residues - 1
+        ocf_sum = np.zeros(n_lags, dtype=np.float64)
+        count   = np.zeros(n_lags, dtype=np.int64)
+
+        n_frames = 0
+        for _ts in u.trajectory[start : _traj_stop(stop) : stride]:
+            all_pos = u.atoms.positions
+            pos_c1  = all_pos[c1_indices]
+            pos_na  = all_pos[na_indices]
+
+            diff = pos_na - pos_c1
+            nrm  = np.linalg.norm(diff, axis=1, keepdims=True)
+            nrm  = np.where(nrm == 0.0, 1.0, nrm)
+            bds  = diff / nrm
+
+            for k in range(1, n_residues):
+                dots = np.einsum("ij,ij->i", bds[: n_residues - k], bds[k:])
+                ocf_sum[k - 1] += dots.sum()
+                count[k - 1]   += len(dots)
+
+            n_frames += 1
+
+        if n_frames == 0:
+            typer.echo(
+                f"  [!] Segment {segid}: trajectory slice is empty — skipped.",
+                err=True,
+            )
+            return segid, None
+
+        ocf = ocf_sum / count
         typer.echo(
-            f"  [!] Segment {segid}: only {natom} ref atom(s) — need ≥ 3 "
-            f"to form at least one lag-1 pair.",
-            err=True,
+            f"  [+] Segment {segid}: {n_residues} residues, {n_lags} lags, "
+            f"{n_frames} frames"
         )
-        return segid, None
-
-    # Accumulators for lags 1 … nbond-1.
-    # Array index k-1 stores lag k: index 0 → lag 1, index nbond-2 → lag nbond-1.
-    n_lags  = nbond - 1
-    ocf_sum = np.zeros(n_lags, dtype=np.float64)
-    count   = np.zeros(n_lags, dtype=np.int64)
-
-    n_frames = 0
-    for _ts in u.trajectory[start : _traj_stop(stop) : stride]:
-        pos  = sel.positions                            # (natom, 3)
-        diff = pos[1:] - pos[:-1]                      # (nbond, 3)  bond vectors
-        nrm  = np.linalg.norm(diff, axis=1, keepdims=True)
-        # Guard against zero-length bonds (degenerate frames).
-        nrm  = np.where(nrm == 0.0, 1.0, nrm)
-        bds  = diff / nrm                              # (nbond, 3)  unit vectors
-
-        # Vectorised lag accumulation.
-        # Original double loop: i in range(len(bds)-1), j in range(i+1, len(bds))
-        #   ij = j - i  runs from 1 to nbond-1.
-        # Equivalent: for each lag k = 1..nbond-1,
-        #   pairs are (bds[0],bds[k]), (bds[1],bds[k+1]), ..., (bds[nbond-1-k], bds[nbond-1])
-        #   i.e. bds[:nbond-k]  dot  bds[k:]
-        for k in range(1, nbond):        # k = lag = 1 … nbond-1
-            dots = np.einsum("ij,ij->i", bds[: nbond - k], bds[k:])
-            ocf_sum[k - 1] += dots.sum()
-            count[k - 1]   += len(dots)
-
-        n_frames += 1
-
-    if n_frames == 0:
-        typer.echo(
-            f"  [!] Segment {segid}: trajectory slice is empty — skipped.",
-            err=True,
-        )
-        return segid, None
-
-    # Normalise: ocf[k-1] = ocf_sum[k-1] / count[k-1]  for k = 1..nbond-1.
-    # Matches original:  for i in range(1, natom-1): ocfs[i] /= nums[i]
-    ocf = ocf_sum / count                              # (n_lags,) = (nbond-1,)
-
-    typer.echo(
-        f"  [+] Segment {segid}: {natom} atoms, {n_lags} lags, {n_frames} frames"
-    )
-    return segid, ocf
+        return segid, ocf
 
 
 @app.command("ocf")
@@ -5346,34 +5438,54 @@ def cmd_ocf(
                     "Omit to use all segments."
                 ),
             )] = None,
-    ref:    Annotated[str, typer.Option(
-                "--ref",
-                help="Reference atom name traced along the chain backbone "
-                     "(e.g. 'CA' for proteins, 'P' for lipids/nucleic acids).",
-            )] = "CA",
+    ocf_mode: Annotated[str, typer.Option(
+                "--ocf",
+                help="OCF mode: 'ocf' for backbone P-P bond vectors, "
+                     "'bocf' for C1->NA glycosidic bond vectors.",
+            )] = "ocf",
     out:    Annotated[str, typer.Option("--out",  help="Output .dat file")] = "ocf.dat",
     start:  Annotated[int, typer.Option("--start",  help="First frame index")]                = 0,
     stop:   Annotated[int, typer.Option("--stop",   help="Last frame index; -1 = end")]       = -1,
     stride: Annotated[int, typer.Option("--stride", help="Frame stride")]                     = 1,
     nproc:  Annotated[int, typer.Option("--nproc",  help="Parallel worker processes")]        = 4,
 ):
-    """Compute the **orientational correlation function** (OCF) per chain.
+    """Compute the orientational correlation function (OCF) per chain.
 
-    For every chain selected by ``--sel``, the OCF measures how quickly
-    bond-vector orientation memory decays along the backbone:
+    Measures how quickly bond-vector orientational memory decays along
+    the backbone of each selected chain.  Two bond-vector definitions are
+    available, selected via ``--ocf``:
+
+    **ocf** (default) — Backbone P–P bond vectors:
 
     .. math::
 
-        C(k) = \\langle \\mathbf{b}_i \\cdot \\mathbf{b}_{i+k}
-               \\rangle_{i,\\,\\text{frames}}
+        \\mathbf{b}_i = \\frac{\\mathbf{r}_{P_{i+1}} - \\mathbf{r}_{P_i}}
+                       {|\\mathbf{r}_{P_{i+1}} - \\mathbf{r}_{P_i}|}
 
-    where **b**_i is the unit vector of the *i*-th bond formed by consecutive
-    ``--ref`` atoms, and *k* is the bond-index lag (1 … N−1 for a chain with
-    *N* reference atoms).
+    Consecutive phosphorus beads define the tangent to the backbone.
+    Hardcoded atom name: ``P``.
 
-    Output is a ``.dat`` file with rows ``lag  chain1  chain2  …``, one row
-    per lag value.  Each column is the OCF for that chain averaged over all
-    valid *(i, i+k)* pairs across all analysed frames.
+    **bocf** — Glycosidic C1→NA bond vectors (coarse-grained):
+
+    .. math::
+
+        \\mathbf{b}_i = \\frac{\\mathbf{r}_{\\mathrm{NA}_i}
+                       - \\mathbf{r}_{\\mathrm{C1}_i}}
+                       {|\\mathbf{r}_{\\mathrm{NA}_i}
+                       - \\mathbf{r}_{\\mathrm{C1}_i}|}
+
+    The direction from the sugar bead (C1) to the nucleobase bead (NA)
+    within each nucleotide residue.  Hardcoded atom names: ``C1``, ``NA``.
+
+    In both modes the OCF at bond-index lag *k* is:
+
+    .. math::
+
+        C(k) = \\left\\langle \\mathbf{b}_i \\cdot \\mathbf{b}_{i+k}
+               \\right\\rangle_{i,\\,\\text{frames}}
+
+    where the average runs over all valid pairs *(i, i+k)* within every
+    analysed frame.
 
     Args:
         top (str): Topology file path (PSF, GRO, …).
@@ -5382,10 +5494,9 @@ def cmd_ocf(
             segment (``"R001"``), a range (``"R001-R099"``), or a
             comma-separated mix (``"R001-R099,K001-K010"``).  Omit to include
             all segments in the topology.
-        ref (str): Name of the backbone atom used to build bond vectors.
-            ``"CA"`` for coarse-grained or all-atom proteins; ``"P"`` for
-            lipid or nucleic-acid phosphate backbones.
-        out (str): Output file path.
+        ocf_mode (str): Bond-vector mode.  ``"ocf"`` uses backbone P–P bonds;
+            ``"bocf"`` uses per-residue C1→NA glycosidic bonds (CG model).
+        out (str): Output file path (``.dat``).
         start (int): Index of the first trajectory frame to include.
         stop (int): Index of the last trajectory frame (inclusive); ``-1``
             means read to the end of the trajectory.
@@ -5395,23 +5506,33 @@ def cmd_ocf(
 
     Output:
         ``<out>`` — tab-separated columns: ``lag  <segid1>  <segid2>  …``
-        *lag* counts bond-vector steps (1 = nearest neighbours, 2 = one bond
+
+        *lag* counts bond-vector steps (1 = nearest neighbours, 2 = one step
         apart, etc.).  Values are dimensionless cosines in [−1, 1].
 
-    Example::
+    Examples::
 
-        # Protein backbone (Cα), all chains in R001-R240
+        # Backbone P-P OCF for RNA chains R001-R240
         scical ocf --top conf.psf --traj system.xtc --sel R001-R240 \\
-            --ref CA --out ocf.dat --stride 1 --nproc 8
+            --ocf ocf --out ocf.dat --nproc 8
 
-        # Lipid phosphate backbone, last 1000 frames
-        scical ocf --top mem.psf --traj mem.xtc --sel L001-L240 \\
-            --ref P --out ocf_lipid.dat --start -1000 --nproc 8
+        # Glycosidic C1->NA OCF (CG nucleic acid model)
+        scical ocf --top conf.psf --traj system.xtc --sel R001-R240 \\
+            --ocf bocf --out ocf_base.dat --nproc 8
     """
     _suppress_warnings()
     import MDAnalysis as mda
 
-    # ── Load topology and resolve segment selection ─────────────────────────
+    # — Validate --ocf mode
+    ocf_mode = ocf_mode.lower()
+    if ocf_mode not in ("ocf", "bocf"):
+        typer.echo(
+            f"[!] Invalid --ocf mode '{ocf_mode}'. Must be 'ocf' or 'bocf'.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    # — Load topology and resolve segment selection
     typer.echo("Loading topology...")
     u = _load_universe(top, traj)
 
@@ -5423,26 +5544,45 @@ def cmd_ocf(
 
     segids = [u.segments[i].segid for i in sel_indices]
 
-    # ── Validate that --ref atoms actually exist in at least one segment ────
-    probe = u.select_atoms(f"name {ref}")
-    if len(probe) == 0:
-        typer.echo(
-            f"[!] No atoms named '{ref}' found in the topology.  "
-            f"Check --ref (e.g. 'CA' for proteins, 'P' for lipids).",
-            err=True,
-        )
-        raise typer.Exit(1)
+    # — Validate atoms exist in topology
+    if ocf_mode == "ocf":
+        probe = u.select_atoms("name P")
+        if len(probe) == 0:
+            typer.echo(
+                "[!] No atoms named 'P' found in the topology.",
+                err=True,
+            )
+            raise typer.Exit(1)
+    else:
+        probe_c1 = u.select_atoms("name C1")
+        if len(probe_c1) == 0:
+            typer.echo(
+                "[!] No atoms named 'C1' found in the topology.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        probe_na = u.select_atoms("name NA")
+        if len(probe_na) == 0:
+            typer.echo(
+                "[!] No atoms named 'NA' found in the topology.",
+                err=True,
+            )
+            raise typer.Exit(1)
 
-    # ── Info banner ─────────────────────────────────────────────────────────
-    typer.echo(f"[i] Segments  : {segids}")
-    typer.echo(f"[i] Ref atom  : {ref}")
-    typer.echo(f"[i] Frames    : start={start}  stop={stop}  stride={stride}")
-    typer.echo(f"[i] Workers   : {nproc}")
-    typer.echo(f"[i] Output    : {out}")
+    # — Info banner
+    typer.echo(f"[i] Mode       : {ocf_mode.upper()}")
+    typer.echo(f"[i] Segments   : {segids}")
+    if ocf_mode == "ocf":
+        typer.echo("[i] Bond vector: P_{i+1} - P_i  (backbone)")
+    else:
+        typer.echo("[i] Bond vector: NA - C1  (glycosidic, CG)")
+    typer.echo(f"[i] Frames     : start={start}  stop={stop}  stride={stride}")
+    typer.echo(f"[i] Workers    : {nproc}")
+    typer.echo(f"[i] Output     : {out}")
 
-    # ── Dispatch one worker per chain ────────────────────────────────────────
+    # — Dispatch one worker per chain
     work_args = [
-        (segid, ref, top, traj, start, stop, stride)
+        (segid, ocf_mode, top, traj, start, stop, stride)
         for segid in segids
     ]
 
@@ -5452,7 +5592,7 @@ def cmd_ocf(
         with Pool(nproc) as pool:
             results = pool.map(_ocf_worker, work_args)
 
-    # ── Collect valid results (preserve --sel ordering) ─────────────────────
+    # — Collect valid results
     valid_segids: list = []
     ocf_all:      list = []
     for segid, ocf in results:
@@ -5464,26 +5604,20 @@ def cmd_ocf(
         typer.echo("[!] No valid OCF results — nothing written.", err=True)
         raise typer.Exit(1)
 
-    # ── Align lengths (chains may differ in natom → different nbond) ────────
-    # Truncate every array to the shortest chain so the output matrix is
-    # rectangular.  Chains with more atoms simply contribute fewer long-lag
-    # columns than they could — warn the user if lengths differ.
+    # — Align lengths
     lengths = [len(o) for o in ocf_all]
     if len(set(lengths)) > 1:
         typer.echo(
-            f"[w] Chains have different numbers of '{ref}' atoms "
-            f"(lag lengths: {sorted(set(lengths))}).  "
-            f"Truncating all columns to the shortest chain ({min(lengths)} lags).",
+            f"[w] Chains have different lag lengths: {sorted(set(lengths))}.  "
+            f"Truncating all columns to the shortest ({min(lengths)} lags).",
             err=True,
         )
     min_lags = min(lengths)
     ocf_all  = [o[:min_lags] for o in ocf_all]
 
-    # ── Write output ─────────────────────────────────────────────────────────
-    # Format: tab-separated, first column = lag (1-indexed), then one column
-    # per chain.  Header line starts with '#'.
+    # — Write output
     typer.echo(
-        f"\nWriting OCF -> {out}  "
+        f"\nWriting {ocf_mode.upper()} -> {out}  "
         f"({len(valid_segids)} chains, {min_lags} lags)"
     )
     W = 14
