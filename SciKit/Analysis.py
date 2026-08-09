@@ -6122,8 +6122,9 @@ def _persistence_fit(positions_per_frame: "np.ndarray"):
         ``(lp, lp_stderr, lb, lag, bond_autocorr)`` — the fitted
         persistence length, its standard error from the fit covariance,
         the mean bond length (all in ångström), the contour-separation
-        lag values in bond units (``0, 1, 2, ...``), and the raw measured
-        autocorrelation ``C(lag)`` — or ``None`` if the fit fails.
+        lag values in REAL LENGTH UNITS (``0, lb, 2*lb, ...`` — ångström,
+        not bond count), and the raw measured autocorrelation ``C(lag)``
+        — or ``None`` if the fit fails.
     """
     import numpy as np
     from scipy.optimize import curve_fit
@@ -6157,14 +6158,16 @@ def _persistence_fit(positions_per_frame: "np.ndarray"):
     norm = np.linspace(n_bonds, 1, n_bonds) * len(bond_lengths)
     bond_autocorr = accum / norm
     lb_mean = float(np.mean(bond_lengths))
-    lag = np.arange(n_bonds)  # contour separation, in bond units
 
-    def model(n, lp):
-        return np.exp(-n * lb_mean / lp)
+    # Lag in REAL contour length (Å), not bond-index units: n * <bond length>
+    lag = lb_mean * np.arange(n_bonds)
+
+    def model(x, lp):
+        return np.exp(-x / lp)
 
     try:
         popt, pcov = curve_fit(
-            model, lag, bond_autocorr, p0=[5.0], maxfev=5000
+            model, lag, bond_autocorr, p0=[5.0 * lb_mean], maxfev=5000
         )
         lp = float(popt[0])
         lp_err = float(np.sqrt(pcov[0, 0])) if np.isfinite(pcov[0, 0]) else 0.0
@@ -6192,10 +6195,11 @@ def _lp_worker(args: tuple):
               indices to include.
 
     Returns:
-        Optional[tuple[str, float, float, np.ndarray, np.ndarray]]:
-        ``(segid, lp, error, lag, bond_autocorr)`` — Lp and its fit error
-        in ångström, plus the raw ``lag``/``C(lag)`` arrays used for the
-        fit — or ``None`` if the segment couldn't be analysed.
+        Optional[tuple[str, float, float, float, np.ndarray, np.ndarray]]:
+        ``(segid, lp, error, lb, lag, bond_autocorr)`` — Lp, its fit error,
+        and the mean bond length (all in ångström), plus the raw
+        ``lag``/``C(lag)`` arrays used for the fit — or ``None`` if the
+        segment couldn't be analysed.
     """
     _suppress_warnings()
     import numpy as np
@@ -6217,8 +6221,8 @@ def _lp_worker(args: tuple):
     if result is None:
         return None
 
-    lp, lp_err, _lb, lag, bond_autocorr = result
-    return (segid, lp, lp_err, lag, bond_autocorr)
+    lp, lp_err, lb, lag, bond_autocorr = result
+    return (segid, lp, lp_err, lb, lag, bond_autocorr)
 
 
 @app.command("lp")
@@ -6256,7 +6260,7 @@ def cmd_lp(
     error of the fitted Lp from the exponential fit's own covariance —
     no block-splitting or bootstrapping needed.
 
-    In addition to the fitted ``lp``/``error`` per segment, the raw
+    In addition to the fitted ``lp``/``error``/``lb`` per segment, the raw
     bond-vector autocorrelation curve C(lag) that went into each fit is
     written to ``--corr-out``, one column per segment, so the underlying
     decay curves can be inspected or re-fit independently.
@@ -6279,10 +6283,14 @@ def cmd_lp(
         nproc (int): Number of parallel worker processes.
 
     Output:
-        ``<out>`` — three columns: ``segment  lp  error`` (Å).
-        ``<corr_out>`` — ``lag  C_<segid1>  C_<segid2>  …`` (lag in bond
-        units; segments with fewer bonds than the longest segment are
-        padded with ``nan`` past their own chain length).
+        ``<out>`` — four columns: ``segment  lp  error  lb`` (Å).
+        ``<corr_out>`` — ``idx  C_<segid1>  C_<segid2>  …`` where ``idx``
+        is the bond-index lag (0, 1, 2, …); each segment's true
+        contour-length lag in Å is ``idx * lb`` using that segment's
+        ``lb`` from ``<out>`` (segments have different bond lengths, so a
+        single shared Å column isn't meaningful — see ``<out>`` for the
+        per-segment scale factor). Segments shorter than the longest are
+        padded with ``nan`` past their own chain length.
 
     Example::
 
@@ -6346,25 +6354,25 @@ def cmd_lp(
         typer.echo("[!] No valid results — nothing written.", err=True)
         return
 
-    # ── Write fitted Lp values ───────────────────────────────────────────
+    # ── Write fitted Lp + bond length values ─────────────────────────────
     W = 14
     with open(out, "w") as fh:
-        fh.write("# segment, lp, error\n")
-        for segid, lp, error, _lag, _corr in rows:
-            fh.write(f"{segid:>{W}} {lp:{W}.6f} {error:{W}.6f}\n")
+        fh.write("# segment, lp, error, lb\n")
+        for segid, lp, error, lb, _lag, _corr in rows:
+            fh.write(f"{segid:>{W}} {lp:{W}.6f} {error:{W}.6f} {lb:{W}.6f}\n")
 
-    # ── Write raw correlation curves: lag, C_seg1, C_seg2, … ─────────────
-    max_len = max(len(lag) for _s, _l, _e, lag, _c in rows)
-    lag_col = np.arange(max_len)
+    # ── Write raw correlation curves: idx, C_seg1, C_seg2, … ─────────────
+    max_len = max(len(lag) for *_r, lag, _c in rows)
+    idx_col = np.arange(max_len)
     corr_cols = []
-    for _segid, _lp, _err, lag, corr in rows:
+    for _segid, _lp, _err, _lb, _lag, corr in rows:
         padded = np.full(max_len, np.nan)
         padded[: len(corr)] = corr
         corr_cols.append(padded)
 
-    corr_data = np.column_stack([lag_col] + corr_cols)
+    corr_data = np.column_stack([idx_col] + corr_cols)
     corr_header = " ".join(
-        [f"{'lag':>{W - 2}}"] + [f"C_{segid:>{W-2}}" for segid, *_ in rows]
+        [f"{'idx':>{W - 2}}"] + [f"C_{segid:>{W-2}}" for segid, *_ in rows]
     )
     np.savetxt(
         corr_out, corr_data, header=corr_header,
