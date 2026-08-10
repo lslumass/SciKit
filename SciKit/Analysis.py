@@ -73,6 +73,18 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import Pool, cpu_count
 from typing import List, Optional, Annotated
 
+# NOTE: use the 'spawn' start method (not the platform-default 'fork') for
+# every worker pool in this module. 'fork' clones the parent's open file
+# handles/state into each worker, which was found to silently corrupt DCD
+# trajectory reads under multiprocessing (confirmed: XTC gave identical
+# results at any --nproc; DCD only matched a single-process run at
+# --nproc 1). 'spawn' starts each worker as a fresh process with no
+# inherited file state, which fixes this at the cost of slightly slower
+# worker startup. Do not swap this back to a bare Pool()/ProcessPoolExecutor()
+# call — that reintroduces the bug for anyone running these commands on DCD
+# trajectories.
+_MP_CTX = mp.get_context("spawn")
+
 import numpy as np
 import typer
 from scipy.spatial import cKDTree
@@ -338,7 +350,7 @@ def cmd_msd(
         for segid in segids
     ]
 
-    with ProcessPoolExecutor(max_workers=nproc) as executor:
+    with ProcessPoolExecutor(max_workers=nproc, mp_context=_MP_CTX) as executor:
         futures = {executor.submit(_msd_worker, a): a[0] for a in args_list}
         for future in as_completed(futures):
             segid = futures[future]
@@ -587,7 +599,7 @@ def cmd_rg(
     if n_workers == 1:
         all_results = [_rg_worker(worker_args[0])]
     else:
-        with Pool(n_workers) as pool:
+        with _MP_CTX.Pool(n_workers) as pool:
             all_results = pool.map(_rg_worker, worker_args)
 
     # ── Merge: reconstruct per-segment time series in frame order ───────────
@@ -841,7 +853,7 @@ def cmd_dssp(
     if n_workers == 1:
         all_results = [_dssp_worker(worker_args[0])]
     else:
-        with Pool(n_workers) as pool:
+        with _MP_CTX.Pool(n_workers) as pool:
             all_results = pool.map(_dssp_worker, worker_args)
 
     # Merge: sum H/E counts across workers per segment
@@ -1217,7 +1229,7 @@ def cmd_dist(
         for wid, sl in enumerate(slices)
     ]
 
-    with Pool(processes=len(slices)) as pool:
+    with _MP_CTX.Pool(processes=len(slices)) as pool:
         results = pool.map(_dist_worker, work_args)
 
     results.sort(key=lambda r: r[0][0])
@@ -1442,7 +1454,7 @@ def cmd_dist_acf(
         for r1, s1, r2, s2 in pair_list
     ]
 
-    with Pool(nproc) as pool:
+    with _MP_CTX.Pool(nproc) as pool:
         results = pool.map(_dist_acf_worker, args_list)
 
     labels, C_all = zip(*[(lbl, C) for lbl, C in results if C is not None]) \
@@ -1607,7 +1619,7 @@ def cmd_vector_acf(
         for r1, s1, r2, s2 in pair_list
     ]
 
-    with Pool(nproc) as pool:
+    with _MP_CTX.Pool(nproc) as pool:
         results = pool.map(_vec_acf_worker, args_list)
 
     labels, C_all = [], []
@@ -2010,8 +2022,7 @@ def cmd_contacts(
     if nprocs == 1:
         results = [_contacts_worker(worker_args[0])]
     else:
-        ctx = mp.get_context("forkserver")
-        with ctx.Pool(processes=nprocs) as pool:
+        with _MP_CTX.Pool(processes=nprocs) as pool:
             results = pool.map(_contacts_worker, worker_args)
 
     # ── Merge and save ─────────────────────────────────────────────────────
@@ -3246,7 +3257,7 @@ def cmd_aggr(
         tmp_paths: list = []
         futures:   dict = {}
 
-        with ProcessPoolExecutor(max_workers=nproc) as pool:
+        with ProcessPoolExecutor(max_workers=nproc, mp_context=_MP_CTX) as pool:
             for chunk, start_rank in zip(chunks, chunk_start_ranks):
                 tmp = tempfile.mktemp(suffix=".xtc") if recenter else None
                 if tmp:
@@ -3962,7 +3973,7 @@ def cmd_time_s2(
             if (i + 1) % report_every == 0:
                 typer.echo(f"  {i + 1}/{n_tasks} residues done (resid {rid})")
     else:
-        with Pool(processes=nproc) as pool:
+        with _MP_CTX.Pool(processes=nproc) as pool:
             for i, rid in enumerate(
                 pool.imap_unordered(_s2_residue_worker, tasks)
             ):
@@ -4455,7 +4466,7 @@ def cmd_intracf(
             for wid, chunk in enumerate(chunks)
         ]
 
-        with Pool(n_workers) as pool:
+        with _MP_CTX.Pool(n_workers) as pool:
             results = pool.map(_intracf_worker, work_args)
 
         n_segs = len(segids)
@@ -5087,7 +5098,7 @@ def cmd_density(
     if n_workers == 1:
         results = [_density_worker(work_args[0])]
     else:
-        with Pool(n_workers) as pool:
+        with _MP_CTX.Pool(n_workers) as pool:
             results = pool.map(_density_worker, work_args)
 
     # ── Merge results from all workers ─────────────────────────────────────
@@ -5171,7 +5182,7 @@ def cmd_density(
         if n_workers == 1:
             dist_results = [_ref_distance_worker(dist_work_args[0])]
         else:
-            with Pool(n_workers) as pool:
+            with _MP_CTX.Pool(n_workers) as pool:
                 dist_results = pool.map(_ref_distance_worker, dist_work_args)
 
         col_of_frame = {f: i for i, f in enumerate(frame_indices)}
@@ -5589,7 +5600,7 @@ def cmd_ocf(
     if nproc == 1:
         results = [_ocf_worker(a) for a in work_args]
     else:
-        with Pool(nproc) as pool:
+        with _MP_CTX.Pool(nproc) as pool:
             results = pool.map(_ocf_worker, work_args)
 
     # — Collect valid results
@@ -6005,7 +6016,7 @@ def cmd_saxs(
         if n_workers == 1:
             all_results = [_saxs_pepsi_worker(worker_args[0])]
         else:
-            with Pool(n_workers) as pool:
+            with _MP_CTX.Pool(n_workers) as pool:
                 all_results = pool.map(_saxs_pepsi_worker, worker_args)
 
         # ── Step 3: Group results by segment/label and average ─────────────
@@ -6344,7 +6355,7 @@ def cmd_lp(
     if n_workers == 1:
         raw_results = [_lp_worker(a) for a in worker_args]
     else:
-        with Pool(n_workers) as pool:
+        with _MP_CTX.Pool(n_workers) as pool:
             raw_results = pool.map(_lp_worker, worker_args)
 
     rows = [r for r in raw_results if r is not None]
