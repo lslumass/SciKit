@@ -292,8 +292,8 @@ def cmd_msd(
     stride:    Annotated[int,  typer.Option("--stride",   help="Frame stride")]               = 1,
     per_atom:  Annotated[bool, typer.Option("--per-atom/--no-per-atom",
                                              help="Write per-atom MSD file for each segment")] = False,
-    com:       Annotated[bool, typer.Option("--com/--no-com", 
-                                             help="Calculate MSD of the Center of Mass instead of average atomic MSD")] = False,
+    com:       Annotated[Optional[bool], typer.Option("--com/--no-com", 
+                                             help="Calculate MSD of the Center of Mass instead of average atomic MSD")] = None,
     max_tau:   Annotated[Optional[float], typer.Option(
                    "--max-tau",
                    help="Maximum lag time (ps); truncates output, not frames read.",
@@ -324,6 +324,7 @@ def cmd_msd(
         stop (int): Index of the last trajectory frame; ``-1`` means end.
         stride (int): Step between analysed frames.
         per_atom (bool): When ``True``, also write per-atom MSD files.
+        com (Optional[bool]): Calculate Center of Mass MSD. Defaults to True if --per-atom is absent.
         max_tau (Optional[float]): Truncate output at this lag time (ps).
             ``None`` (default) uses all available lag times.
         nproc (int): Number of parallel worker processes.
@@ -344,6 +345,10 @@ def cmd_msd(
     """
     _suppress_warnings()
     import MDAnalysis as mda
+    
+    # Set COM to default to True if per-atom is absent and no specific --com/--no-com flag was passed
+    if com is None:
+        com = not per_atom
 
     os.makedirs(outdir, exist_ok=True)
 
