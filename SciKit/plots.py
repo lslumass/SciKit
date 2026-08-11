@@ -21,9 +21,10 @@ def general_temp(num_row, num_col, size_x, size_y, palette=None, pad=(0.2, 0.5),
         Figure width in inches.
     size_y : float
         Figure height in inches.
-    palette : mpl color palette, optional
+    palette : str or None, optional
+        Matplotlib color palette name. Supports both discrete and continuous colormaps.
     pad : tuple of float, optional
-        Padding around the subplots.
+        Padding around the subplots (wspace, hspace).
     *args
         Additional positional arguments forwarded to ``plt.subplots``.
     **kwargs
@@ -40,34 +41,22 @@ def general_temp(num_row, num_col, size_x, size_y, palette=None, pad=(0.2, 0.5),
 
     Notes
     -----
+    - Palette: If a continuous colormap (e.g., 'viridis') is provided, it is automatically 
+      sampled into 8 evenly spaced colors. Discrete colormaps (e.g., 'tab10') use their native colors.
     - Major ticks: inward, width=2, length=8.
     - Minor ticks: inward, width=1.5, length=4.
     - Spine linewidth: 2.
     - Font: Arial, size 18.
     - Default line width: 2.0; marker: 'o', size 6.
-
-    Examples
-    --------
-    >>> fig, axs = general_temp(2, 3, 12, 8)
-    >>> axs[0].plot([1, 2, 3], [4, 5, 6])
-    >>> fig.savefig("output.png")
+    - Savefig DPI: Defaults to 600.
     """
-    fig, axs = plt.subplots(num_row, num_col, figsize=(size_x, size_y), *args, **kwargs)
-    plt.subplots_adjust(wspace=pad[0], hspace=pad[1])
-
     if palette is not None:
-        plt.rcParams['axes.prop_cycle'] = plt.cycler(color=plt.get_cmap(palette).colors)
-        
-    if num_row*num_col != 1:
-        axs = axs.ravel()
-        for ax in axs:
-            ax.tick_params(axis="both", which='major', direction='in', width=2, length=8.0)
-            ax.tick_params(axis="both", which='minor', direction='in', width=1.5, length=4.0)
-            plt.setp(ax.spines.values(), linewidth=2)
-    else:
-        axs.tick_params(axis="both", which='major', direction='in', width=2, length=8.0)
-        axs.tick_params(axis="both", which='minor', direction='in', width=1.5, length=4.0)
-        plt.setp(axs.spines.values(), linewidth=2)
+        cmap = plt.get_cmap(palette)
+        if hasattr(cmap, 'colors'):
+            colors = cmap.colors
+        else:
+            colors = cmap(np.linspace(0, 1, 8)) 
+        plt.rcParams['axes.prop_cycle'] = plt.cycler(color=colors)
 
     plt.rcParams['font.family'] = "Arial"
     plt.rcParams['font.size'] = 18    
@@ -77,6 +66,20 @@ def general_temp(num_row, num_col, size_x, size_y, palette=None, pad=(0.2, 0.5),
     plt.rcParams['scatter.marker'] = 'o'
     plt.rcParams['lines.markersize'] = 6
     plt.rcParams["savefig.dpi"] = 600
+
+    fig, axs = plt.subplots(num_row, num_col, figsize=(size_x, size_y), *args, **kwargs)
+    plt.subplots_adjust(wspace=pad[0], hspace=pad[1])
+
+    if num_row * num_col != 1:
+        axs = axs.ravel()
+        for ax in axs:
+            ax.tick_params(axis="both", which='major', direction='in', width=2, length=8.0)
+            ax.tick_params(axis="both", which='minor', direction='in', width=1.5, length=4.0)
+            plt.setp(ax.spines.values(), linewidth=2)
+    else:
+        axs.tick_params(axis="both", which='major', direction='in', width=2, length=8.0)
+        axs.tick_params(axis="both", which='minor', direction='in', width=1.5, length=4.0)
+        plt.setp(axs.spines.values(), linewidth=2)
 
     return fig, axs
 
