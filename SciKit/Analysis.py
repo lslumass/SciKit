@@ -163,6 +163,7 @@ def _msd_worker(args: tuple):
             - **per_atom** (*bool*) — Whether to write per-atom MSD files.
             - **max_tau** (*Optional[float]*) — Maximum lag time in ps;
               ``None`` keeps all lag times.
+            - **use_com** (*bool*) — Whether to compute the MSD of the center of mass.
 
     Returns:
         str: The *segid* that was processed, for logging in the parent process.
@@ -177,12 +178,14 @@ def _msd_worker(args: tuple):
           *per_atom* is ``True``).
     """
     _suppress_warnings()
+    import numpy as np
+    import os
     import MDAnalysis as mda
     import MDAnalysis.analysis.msd as msd_mod
     from MDAnalysis import transformations
 
     segid, topology, trajectory, ref, resid_range, \
-        start, stop, stride, outdir, per_atom, max_tau = args
+        start, stop, stride, outdir, per_atom, max_tau, use_com = args
 
     u = mda.Universe(topology, trajectory)
 
@@ -194,8 +197,10 @@ def _msd_worker(args: tuple):
     whole_segment_ag = u.select_atoms(f"segid {segid}")
     if len(whole_segment_ag) == 0:
         raise ValueError(f"No atoms found for segid '{segid}' to unwrap.")
-    unwrap_transform = transformations.unwrap(whole_segment_ag)
-    u.trajectory.add_transformations(unwrap_transform)
+    
+    make_whole = transformations.unwrap(whole_segment_ag)
+    remove_jumps = transformations.NoJump()
+    u.trajectory.add_transformations(make_whole, remove_jumps)
     # ─────────────────────────────────────────────────────────────────────────
 
     selection = f"name {ref} and segid {segid}"
@@ -208,11 +213,26 @@ def _msd_worker(args: tuple):
 
     effective_stop = _traj_stop(stop)
 
-    MSD = msd_mod.EinsteinMSD(u, select=selection, msd_type="xyz", fft=True)
-    MSD.run(start=start, stop=effective_stop, step=stride)
+    if use_com:
+        import tidynamics
+        com_positions = []
+        
+        for ts in u.trajectory[start:effective_stop:stride]:
+            com_positions.append(ag.center_of_mass())
+            
+        com_positions = np.array(com_positions)
+        
+        msds = tidynamics.msd(com_positions)
+        
+        dt = u.trajectory.dt if u.trajectory.dt else 1.0
+        lagtimes = np.arange(len(msds)) * dt * stride
+        
+    else:
+        MSD = msd_mod.EinsteinMSD(u, select=selection, msd_type="xyz", fft=True)
+        MSD.run(start=start, stop=effective_stop, step=stride)
 
-    lagtimes = MSD.results.delta_t_values
-    msds     = MSD.results.timeseries
+        lagtimes = MSD.results.delta_t_values
+        msds     = MSD.results.timeseries
 
     if max_tau is not None:
         mask     = lagtimes <= max_tau
@@ -220,7 +240,9 @@ def _msd_worker(args: tuple):
         msds     = msds[mask]
 
     W = 16
-    total_file = os.path.join(outdir, f"{segid}_msd.dat")
+    file_prefix = f"{segid}_com" if use_com else segid
+    total_file = os.path.join(outdir, f"{file_prefix}_msd.dat")
+    
     np.savetxt(
         total_file,
         np.column_stack((lagtimes, msds)),
@@ -228,11 +250,11 @@ def _msd_worker(args: tuple):
         fmt=f"%{W}.6f",
     )
 
-    if per_atom:
-        msds_by_atom = MSD.results.msds_by_particle   # shape (n_lagtimes, n_atoms)
+    if per_atom and not use_com: 
+        msds_by_atom = MSD.results.msds_by_particle
         if max_tau is not None:
             msds_by_atom = msds_by_atom[mask]
-        resids  = ag.resids                            # always populated; matches original
+        resids  = ag.resids
         W2      = 14
         header_atom = " ".join(
             [f"{'lag_time(ps)':>{W2 - 2}}"] + [f"{r:>{W2}}" for r in resids]
@@ -270,6 +292,8 @@ def cmd_msd(
     stride:    Annotated[int,  typer.Option("--stride",   help="Frame stride")]               = 1,
     per_atom:  Annotated[bool, typer.Option("--per-atom/--no-per-atom",
                                              help="Write per-atom MSD file for each segment")] = False,
+    com:       Annotated[bool, typer.Option("--com/--no-com", 
+                                             help="Calculate MSD of the Center of Mass instead of average atomic MSD")] = False,
     max_tau:   Annotated[Optional[float], typer.Option(
                    "--max-tau",
                    help="Maximum lag time (ps); truncates output, not frames read.",
@@ -360,12 +384,13 @@ def cmd_msd(
     typer.echo(f"[i] Region      : {'resid ' + resid if resid else 'full segment'}")
     typer.echo(f"[i] Frames      : start={start} stop={stop} stride={stride}")
     typer.echo(f"[i] Per-atom    : {per_atom}")
+    typer.echo(f"[i] Use COM     : {com}")
     typer.echo(f"[i] Max tau     : {f'{max_tau} ps' if max_tau is not None else 'all'}")
     typer.echo(f"[i] Output dir  : {outdir}")
     del u
 
     args_list = [
-        (segid, top, traj, ref, resid, start, stop, stride, outdir, per_atom, max_tau)
+        (segid, top, traj, ref, resid, start, stop, stride, outdir, per_atom, max_tau, com)
         for segid in segids
     ]
 
