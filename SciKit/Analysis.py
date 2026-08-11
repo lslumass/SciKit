@@ -141,6 +141,12 @@ def _msd_worker(args: tuple):
     MDAnalysis locally so that the module can be imported without the package
     being installed in the parent process.
 
+    Positions are unwrapped across periodic boundaries before the MSD is
+    computed, since MDAnalysis' ``EinsteinMSD`` operates directly on whatever
+    coordinates are stored in the trajectory (wrapped, in the case of a
+    default OpenMM DCD).  Without unwrapping, MSD saturates at a plateau set
+    by the box size rather than reflecting real long-time diffusion.
+
     Args:
         args (tuple): A packed argument tuple containing:
 
@@ -173,11 +179,24 @@ def _msd_worker(args: tuple):
     _suppress_warnings()
     import MDAnalysis as mda
     import MDAnalysis.analysis.msd as msd_mod
+    from MDAnalysis import transformations
 
     segid, topology, trajectory, ref, resid_range, \
         start, stop, stride, outdir, per_atom, max_tau = args
 
     u = mda.Universe(topology, trajectory)
+
+    # ── Unwrap coordinates across periodic boundaries ───────────────────────
+    # Unwrap must be applied to whole, bonded molecules (not just the CA/P
+    # subset) so MDAnalysis can correctly reconstruct continuity using bond
+    # connectivity from the topology. Select the CA/ref subset afterward,
+    # from the now-unwrapped universe.
+    whole_segment_ag = u.select_atoms(f"segid {segid}")
+    if len(whole_segment_ag) == 0:
+        raise ValueError(f"No atoms found for segid '{segid}' to unwrap.")
+    unwrap_transform = transformations.unwrap(whole_segment_ag)
+    u.trajectory.add_transformations(unwrap_transform)
+    # ─────────────────────────────────────────────────────────────────────────
 
     selection = f"name {ref} and segid {segid}"
     if resid_range:
