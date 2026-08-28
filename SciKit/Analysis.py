@@ -6512,17 +6512,10 @@ def cmd_sq(
         typer.echo(f"[!] No atoms matched selection: '{sel}'", err=True)
         raise typer.Exit(1)
 
-    # ── Workaround for mdcraft 'segments' bug ─────────────────────────────────
-    mdcraft_grouping = groupings
-    if groupings == "segments":
-        typer.echo("[i] Note: Bypassing mdcraft bug (StructureFactor lacks native 'segments' support) by mapping segindices to resindices.")
-        u.atoms.resindices = u.atoms.segindices
-        mdcraft_grouping = "residues"
-
-    # ── Read box dimensions from the first analysed frame ────────────────────
+    # ── Advance to first frame to set correct dimensions ──────────────────────
     n_total     = len(u.trajectory)
     first_frame = start if start >= 0 else max(0, n_total + start)
-    u.trajectory[first_frame] # This naturally updates u.dimensions to the correct frame
+    u.trajectory[first_frame]
     dimensions  = u.dimensions.copy()
 
     # ── Log ───────────────────────────────────────────────────────────────────
@@ -6541,10 +6534,10 @@ def cmd_sq(
     # ── Build and run StructureFactor ─────────────────────────────────────────
     sq_analysis = StructureFactor(
         groups=ag,
-        groupings=mdcraft_grouping,
+        groupings=groupings,  # Your source code modification makes this work natively
         form=form,
-        # OMIT dimensions here to bypass the mdcraft 'or' boolean evaluation bug.
-        # It will default to None and safely fetch self.universe.dimensions[:3] natively.
+        # Intentionally omitted `dimensions=` here to bypass mdcraft numpy bool bug. 
+        # It defaults to None and cleanly grabs self.universe.dimensions internally.
         n_points=n_points,
         q_max=q_max,
         parallel=parallel,
