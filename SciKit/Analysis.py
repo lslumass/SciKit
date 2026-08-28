@@ -6458,7 +6458,7 @@ def cmd_sq(
     top: Annotated[str, typer.Option("--top", help="Topology file")] = "conf.psf",
     traj: Annotated[str, typer.Option("--traj", help="Trajectory file")] = "system.xtc",
     sel: Annotated[str, typer.Option("--sel", help="Atom selection string")] = "name P",
-    grouping: Annotated[str, typer.Option("--grouping",
+    groupings: Annotated[str, typer.Option("--groupings",
         help="Position type: 'atoms', 'residues', or 'segments'")] = "atoms",
     form: Annotated[str, typer.Option("--form",
         help="Form factor expression: 'exp' (faster) or 'trig' (no overflow)")] = "trig",
@@ -6475,7 +6475,7 @@ def cmd_sq(
     nprocs: Annotated[int, typer.Option("--nprocs",
         help="Numba threads passed to run(); controls parallelism")] = 1,
     parallel: Annotated[bool, typer.Option("--parallel/--no-parallel",
-        help="Pass parallel=True to StructureFactor constructor")] = False,
+        help="Enable parallel Numba kernel in StructureFactor (default: True)")] = True,
 ):
     """Calculate the **static structure factor S(q)** using mdcraft.
 
@@ -6487,9 +6487,9 @@ def cmd_sq(
 
     **Groupings**
 
-    ``--grouping`` controls the position used for each particle: atom
+    ``--groupings`` controls the position used for each particle: atom
     positions (``"atoms"``), residue centres of mass (``"residues"``), or
-    segment centres of mass (``"segments"``).  For ``"residues"`` or
+    segment centres of mass (``"segments"``). For ``"residues"`` or
     ``"segments"``, ensure the trajectory is locally unwrapped at box edges
     before running.
 
@@ -6498,38 +6498,15 @@ def cmd_sq(
     ``--nprocs`` is forwarded to ``run(n_threads=...)`` and controls the
     number of Numba threads used by the inner kernel.  ``--parallel`` passes
     ``parallel=True`` to the ``StructureFactor`` constructor, enabling the
-    parallel Numba kernel.  Use both together for maximum throughput.
-
-    Args:
-        top (str): Path to the topology file (PSF, PDB, GRO, …).
-        traj (str): Path to the trajectory file (XTC, DCD, …).
-        sel (str): MDAnalysis atom-selection string, e.g. ``"name P"`` or
-            ``"resname DPPC and name P"``.
-        grouping (str): Position source: ``"atoms"``, ``"residues"``, or
-            ``"segments"``.
-        form (str): Expression for the structure factor kernel:
-            ``"exp"`` or ``"trig"``.
-        q_max (float): Maximum wavenumber in Å⁻¹.
-        n_points (int): Number of wavevector grid points along each axis.
-        out (str): Path for the output ``.dat`` file.
-        start (int): First frame; negative values count from the trajectory end.
-        stop (int): Last frame (exclusive); ``-1`` = trajectory end.
-        stride (int): Step between analysed frames.
-        nprocs (int): Numba threads passed to ``run()``.
-        parallel (bool): Enable parallel Numba kernel in ``StructureFactor``.
-
-    Output:
-        ``<out>`` — two columns: ``q (Å⁻¹)`` and ``S(q)`` (dimensionless).
-
-    Example::
-
-            scical sq --top conf.psf --traj system.xtc --sel "name P" \
-                      --start -10000 --stop -1 --stride 10 \
-                      --q-max 2.0 --n-points 32 --parallel --nprocs 64 --out sq.dat
+    parallel Numba kernel (on by default). Use both together for maximum throughput.
     """
     _suppress_warnings()
     import MDAnalysis as mda
     from mdcraft.analysis.structure import StructureFactor
+
+    if groupings not in ("atoms", "residues", "segments"):
+        typer.echo(f"[!] Invalid grouping '{groupings}'. Valid values: 'atoms', 'residues', 'segments'.", err=True)
+        raise typer.Exit(1)
 
     # ── Load universe and validate selection ──────────────────────────────────
     u  = mda.Universe(top, traj)
@@ -6548,7 +6525,7 @@ def cmd_sq(
     typer.echo("=" * 60)
     typer.echo(f"[i] Topology   : {top}")
     typer.echo(f"[i] Trajectory : {traj}")
-    typer.echo(f"[i] Selection  : '{sel}'  ({len(ag)} atoms, grouping='{grouping}')")
+    typer.echo(f"[i] Selection  : '{sel}'  ({len(ag)} atoms, groupings='{groupings}')")
     typer.echo(f"[i] form       : {form}")
     typer.echo(f"[i] q_max      : {q_max} Å⁻¹   n_points={n_points}")
     typer.echo(f"[i] Frames     : start={start}  stop={stop}  stride={stride}")
@@ -6559,8 +6536,8 @@ def cmd_sq(
 
     # ── Build and run StructureFactor ─────────────────────────────────────────
     sq_analysis = StructureFactor(
-        ag,
-        grouping,
+        groups=ag,
+        groupings=groupings,
         form=form,
         dimensions=dimensions,
         n_points=n_points,
