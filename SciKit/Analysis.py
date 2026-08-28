@@ -6447,7 +6447,145 @@ def cmd_lp(
         msg += f"  [{skipped} segment(s) skipped: fewer than 4 '{ref}' atoms or fit failure]"
     typer.echo(msg)
 
-    
+
+ 
+# =============================================================================
+#  ░░  15. Structure Factor (S(q)) by MDcraft ░░
+# =============================================================================
+
+@app.command("sq")
+def cmd_sq(
+    top: Annotated[str, typer.Option("--top", help="Topology file")] = "conf.psf",
+    traj: Annotated[str, typer.Option("--traj", help="Trajectory file")] = "system.xtc",
+    sel: Annotated[str, typer.Option("--sel", help="Atom selection string")] = "name P",
+    grouping: Annotated[str, typer.Option("--grouping",
+        help="Position type: 'atoms', 'residues', or 'segments'")] = "atoms",
+    form: Annotated[str, typer.Option("--form",
+        help="Form factor expression: 'exp' (faster) or 'trig' (no overflow)")] = "trig",
+    q_max: Annotated[float, typer.Option("--q-max",
+        help="Maximum wavenumber q (Å⁻¹)")] = 2.0,
+    n_points: Annotated[int, typer.Option("--n-points",
+        help="Number of wavevector grid points along each axis")] = 32,
+    out: Annotated[str, typer.Option("--out", help="Output .dat file")] = "sq_mdcraft.dat",
+    start: Annotated[int, typer.Option("--start",
+        help="First frame index; negative values count from the trajectory end")] = -10000,
+    stop: Annotated[int, typer.Option("--stop",
+        help="Last frame index (exclusive); -1 = last frame")] = -1,
+    stride: Annotated[int, typer.Option("--stride", help="Frame stride")] = 10,
+    nproc: Annotated[int, typer.Option("--nproc",
+        help="Parallel worker processes passed to run(n_jobs=); 1 = serial")] = 1,
+    n_threads: Annotated[int, typer.Option("--n-threads",
+        help="Numba threads for the structure factor kernel")] = 1,
+):
+    """Calculate the **static structure factor S(q)** using mdcraft.
+ 
+    Wraps ``mdcraft.analysis.structure.StructureFactor`` (``mode=None``) and
+    writes a two-column ``.dat`` file (q in Å⁻¹, S(q)).
+ 
+    Box dimensions are read from the trajectory at the first analysed frame
+    and passed to ``StructureFactor`` as ``dimensions``.
+ 
+    **Groupings**
+ 
+    ``--grouping`` controls the position used for each particle: atom
+    positions (``"atoms"``), residue centres of mass (``"residues"``), or
+    segment centres of mass (``"segments"``).  For ``"residues"`` or
+    ``"segments"``, ensure the trajectory is locally unwrapped at box edges
+    before running.
+ 
+    **Parallelism**
+ 
+    ``--nproc`` is forwarded to ``run(backend="multiprocessing", n_jobs=nproc)``;
+    use ``1`` (default) for serial execution.  ``--n-threads`` sets the Numba
+    thread count for the inner kernel.
+ 
+    Args:
+        top (str): Path to the topology file (PSF, PDB, GRO, …).
+        traj (str): Path to the trajectory file (XTC, DCD, …).
+        sel (str): MDAnalysis atom-selection string, e.g. ``"name P"`` or
+            ``"resname DPPC and name P"``.
+        grouping (str): Position source: ``"atoms"``, ``"residues"``, or
+            ``"segments"``.
+        form (str): Expression for the structure factor kernel:
+            ``"exp"`` or ``"trig"``.
+        q_max (float): Maximum wavenumber in Å⁻¹.
+        n_points (int): Number of wavevector grid points along each axis.
+        out (str): Path for the output ``.dat`` file.
+        start (int): First frame; negative values count from the trajectory end.
+        stop (int): Last frame (exclusive); ``-1`` = trajectory end.
+        stride (int): Step between analysed frames.
+        nproc (int): Worker processes for ``run()``; ``1`` = serial.
+        n_threads (int): Numba threads for the inner kernel.
+ 
+    Output:
+        ``<out>`` — two columns: ``q (Å⁻¹)`` and ``S(q)`` (dimensionless).
+ 
+    Example::
+ 
+            scical sq --top conf.psf --traj system.xtc --sel "name P" \\
+                      --start -10000 --stop -1 --stride 10 \\
+                      --q-max 2.0 --n-points 32 --nproc 4 --out sq.dat
+    """
+    _suppress_warnings()
+    import MDAnalysis as mda
+    from mdcraft.analysis.structure import StructureFactor
+ 
+    # ── Load universe and validate selection ──────────────────────────────────
+    u  = mda.Universe(top, traj)
+    ag = u.select_atoms(sel)
+    if len(ag) == 0:
+        typer.echo(f"[!] No atoms matched selection: '{sel}'", err=True)
+        raise typer.Exit(1)
+ 
+    # ── Read box dimensions from the first analysed frame ────────────────────
+    n_total     = len(u.trajectory)
+    first_frame = start if start >= 0 else max(0, n_total + start)
+    u.trajectory[first_frame]
+    dimensions  = u.dimensions.copy()
+ 
+    # ── Log ───────────────────────────────────────────────────────────────────
+    typer.echo("=" * 60)
+    typer.echo(f"[i] Topology   : {top}")
+    typer.echo(f"[i] Trajectory : {traj}")
+    typer.echo(f"[i] Selection  : '{sel}'  ({len(ag)} atoms, grouping='{grouping}')")
+    typer.echo(f"[i] form       : {form}")
+    typer.echo(f"[i] q_max      : {q_max} Å⁻¹   n_points={n_points}")
+    typer.echo(f"[i] Frames     : start={start}  stop={stop}  stride={stride}")
+    typer.echo(f"[i] nproc      : {nproc}   n_threads={n_threads}")
+    typer.echo(f"[i] Box        : {dimensions[:3]} Å  (from frame {first_frame})")
+    typer.echo(f"[i] Output     : {out}")
+    typer.echo("=" * 60)
+ 
+    # ── Build and run StructureFactor ─────────────────────────────────────────
+    sq_analysis = StructureFactor(
+        ag,
+        grouping,
+        form=form,
+        dimensions=dimensions,
+        n_points=n_points,
+        q_max=q_max,
+        parallel=nproc > 1,
+    )
+ 
+    stop_arg   = None if stop == -1 else stop
+    run_kwargs = dict(start=start, stop=stop_arg, step=stride, n_threads=n_threads)
+    if nproc > 1:
+        run_kwargs["backend"] = "multiprocessing"
+        run_kwargs["n_jobs"]  = nproc
+ 
+    sq_analysis.run(**run_kwargs)
+ 
+    # ── Write output ──────────────────────────────────────────────────────────
+    qs  = sq_analysis.results.wavenumbers.tolist()
+    sqs = sq_analysis.results.ssf[0].tolist()   # shape (1, n_q) for static S(q)
+ 
+    with open(out, "w") as f:
+        for q_val, sq_val in zip(qs, sqs):
+            print(q_val, sq_val, file=f)
+ 
+    typer.echo(f"[+] S(q) saved -> {out}  ({len(qs)} q-points)")
+
+        
 # =============================================================================
 #  ░░  Entry-point  ░░
 # =============================================================================
