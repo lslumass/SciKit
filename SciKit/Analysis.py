@@ -6482,9 +6482,6 @@ def cmd_sq(
     Wraps ``mdcraft.analysis.structure.StructureFactor`` (``mode=None``) and
     writes a two-column ``.dat`` file (q in Å⁻¹, S(q)).
 
-    Box dimensions are read from the trajectory at the first analysed frame
-    and passed to ``StructureFactor`` as ``dimensions``.
-
     **Groupings**
 
     ``--groupings`` controls the position used for each particle: atom
@@ -6515,10 +6512,17 @@ def cmd_sq(
         typer.echo(f"[!] No atoms matched selection: '{sel}'", err=True)
         raise typer.Exit(1)
 
+    # ── Workaround for mdcraft 'segments' bug ─────────────────────────────────
+    mdcraft_grouping = groupings
+    if groupings == "segments":
+        typer.echo("[i] Note: Bypassing mdcraft bug (StructureFactor lacks native 'segments' support) by mapping segindices to resindices.")
+        u.atoms.resindices = u.atoms.segindices
+        mdcraft_grouping = "residues"
+
     # ── Read box dimensions from the first analysed frame ────────────────────
     n_total     = len(u.trajectory)
     first_frame = start if start >= 0 else max(0, n_total + start)
-    u.trajectory[first_frame]
+    u.trajectory[first_frame] # This naturally updates u.dimensions to the correct frame
     dimensions  = u.dimensions.copy()
 
     # ── Log ───────────────────────────────────────────────────────────────────
@@ -6537,9 +6541,10 @@ def cmd_sq(
     # ── Build and run StructureFactor ─────────────────────────────────────────
     sq_analysis = StructureFactor(
         groups=ag,
-        groupings=groupings,
+        groupings=mdcraft_grouping,
         form=form,
-        dimensions=dimensions,
+        # OMIT dimensions here to bypass the mdcraft 'or' boolean evaluation bug.
+        # It will default to None and safely fetch self.universe.dimensions[:3] natively.
         n_points=n_points,
         q_max=q_max,
         parallel=parallel,
