@@ -6460,6 +6460,8 @@ def cmd_sq(
     sel: Annotated[str, typer.Option("--sel", help="Atom selection string")] = "name P",
     groupings: Annotated[str, typer.Option("--groupings",
         help="Position type: 'atoms', 'residues', or 'segments'")] = "atoms",
+    mode: Annotated[str, typer.Option("--mode",
+        help="Evaluation mode: 'none' (total S(q)), 'pair', or 'partial'")] = "none",
     form: Annotated[str, typer.Option("--form",
         help="Form factor expression: 'exp' (faster) or 'trig' (no overflow)")] = "trig",
     q_max: Annotated[float, typer.Option("--q-max",
@@ -6479,8 +6481,8 @@ def cmd_sq(
 ):
     """Calculate the **static structure factor S(q)** using mdcraft.
 
-    Wraps ``mdcraft.analysis.structure.StructureFactor`` (``mode=None``) and
-    writes a two-column ``.dat`` file (q in Å⁻¹, S(q)).
+    Wraps ``mdcraft.analysis.structure.StructureFactor`` and writes a 
+    two-column ``.dat`` file (q in Å⁻¹, S(q)).
 
     **Groupings**
 
@@ -6501,8 +6503,15 @@ def cmd_sq(
     import MDAnalysis as mda
     from mdcraft.analysis.structure import StructureFactor
 
+    # Validate groupings
     if groupings not in ("atoms", "residues", "segments"):
         typer.echo(f"[!] Invalid grouping '{groupings}'. Valid values: 'atoms', 'residues', 'segments'.", err=True)
+        raise typer.Exit(1)
+
+    # Validate and resolve mode
+    mode_arg = None if mode.lower() == "none" else mode.lower()
+    if mode_arg not in (None, "pair", "partial"):
+        typer.echo(f"[!] Invalid mode '{mode}'. Valid values: 'none', 'pair', 'partial'.", err=True)
         raise typer.Exit(1)
 
     # ── Load universe and validate selection ──────────────────────────────────
@@ -6523,6 +6532,7 @@ def cmd_sq(
     typer.echo(f"[i] Topology   : {top}")
     typer.echo(f"[i] Trajectory : {traj}")
     typer.echo(f"[i] Selection  : '{sel}'  ({len(ag)} atoms, groupings='{groupings}')")
+    typer.echo(f"[i] mode       : {mode_arg}")
     typer.echo(f"[i] form       : {form}")
     typer.echo(f"[i] q_max      : {q_max} Å⁻¹   n_points={n_points}")
     typer.echo(f"[i] Frames     : start={start}  stop={stop}  stride={stride}")
@@ -6534,7 +6544,8 @@ def cmd_sq(
     # ── Build and run StructureFactor ─────────────────────────────────────────
     sq_analysis = StructureFactor(
         groups=ag,
-        groupings=groupings,  # Your source code modification makes this work natively
+        groupings=groupings,
+        mode=mode_arg,
         form=form,
         # Intentionally omitted `dimensions=` here to bypass mdcraft numpy bool bug. 
         # It defaults to None and cleanly grabs self.universe.dimensions internally.
@@ -6548,7 +6559,9 @@ def cmd_sq(
 
     # ── Write output ──────────────────────────────────────────────────────────
     qs  = sq_analysis.results.wavenumbers.tolist()
-    sqs = sq_analysis.results.ssf[0].tolist()   # shape (1, n_q) for static S(q)
+    # Since we are passing a single AtomGroup, mdcraft always generates 1 output row 
+    # for all modes (C(1+1, 2) = 1), so index [0] is always safe.
+    sqs = sq_analysis.results.ssf[0].tolist()
 
     with open(out, "w") as f:
         for q_val, sq_val in zip(qs, sqs):
